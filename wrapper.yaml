@@ -1,0 +1,375 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "WP Suite Flow Backend - CloudFormation wrapper that deploys the SAR app (better UX + SAR regional packaging)"
+Transform: AWS::Serverless-2016-10-31
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Deployment Basics"
+        Parameters:
+          - SarApplicationId
+          - SarSemanticVersion
+          - AppName
+          - Environment
+          - DeploymentVersion
+
+      - Label:
+          default: "Authentication & Access Control"
+        Parameters:
+          - FrontendApiAuthMode
+          - AdminApiAuthMode
+          - AdminCognitoUserPoolId
+          - AdminCognitoAuthScopes
+
+      - Label:
+          default: "Security & Protection"
+        Parameters:
+          - EnableRecaptcha
+          - RecaptchaMode
+          - RecaptchaSecretKey
+          - RecaptchaProjectId
+          - RecaptchaSiteKey
+          - RecaptchaScoreThreshold
+          - EnableWAF
+          - PublicAllowedIPs
+          - AdminAllowedIPs
+          - BlockedIPs
+          - EnableKmsForSecrets
+
+      - Label:
+          default: "Storage Configuration"
+        Parameters:
+          - TemplatesBucketName
+          - PayloadBucketName
+          - TemplatesPrefix
+
+      - Label:
+          default: "Email & Webhooks"
+        Parameters:
+          - FromEmail
+          - DefaultWebhookSigningSecret
+
+      - Label:
+          default: "Data Retention & Performance"
+        Parameters:
+          - DataRetentionDays
+          - LogRetentionDays
+          - LambdaMemorySize
+          - LambdaTimeout
+
+    ParameterLabels:
+      # Deployment Basics
+      SarApplicationId:
+        default: "SAR Application ID"
+      SarSemanticVersion:
+        default: "Version"
+      AppName:
+        default: "Application Name"
+      Environment:
+        default: "Environment"
+      DeploymentVersion:
+        default: "Deployment Version"
+
+      # Authentication
+      FrontendApiAuthMode:
+        default: "Frontend API Authentication Mode"
+      AdminApiAuthMode:
+        default: "Admin API Authentication Mode"
+      AdminCognitoUserPoolId:
+        default: "Admin Cognito User Pool ID"
+      AdminCognitoAuthScopes:
+        default: "Admin Permissions (Scopes)"
+
+      # Security
+      EnableRecaptcha:
+        default: "Enable reCAPTCHA Protection"
+      RecaptchaMode:
+        default: "reCAPTCHA Type"
+      RecaptchaSecretKey:
+        default: "reCAPTCHA Secret Key"
+      RecaptchaProjectId:
+        default: "reCAPTCHA Project ID (Enterprise)"
+      RecaptchaSiteKey:
+        default: "reCAPTCHA Site Key (Enterprise)"
+      RecaptchaScoreThreshold:
+        default: "Security Threshold"
+      EnableWAF:
+        default: "Enable Firewall (WAF)"
+      PublicAllowedIPs:
+        default: "Allowed IPs for Public Endpoints"
+      AdminAllowedIPs:
+        default: "Allowed IPs for Admin Endpoints"
+      BlockedIPs:
+        default: "Blocked IPs"
+      EnableKmsForSecrets:
+        default: "Enable KMS Encryption for Secrets"
+
+      # Storage
+      TemplatesBucketName:
+        default: "Email Templates S3 Bucket (optional)"
+      PayloadBucketName:
+        default: "File Uploads S3 Bucket (optional)"
+      TemplatesPrefix:
+        default: "Templates Prefix"
+
+      # Email & Webhooks
+      FromEmail:
+        default: "From Email Address"
+      DefaultWebhookSigningSecret:
+        default: "Default Webhook Signing Secret"
+
+      # Data Retention & Performance
+      DataRetentionDays:
+        default: "Data Retention (days)"
+      LogRetentionDays:
+        default: "Log Retention (days)"
+      LambdaMemorySize:
+        default: "Lambda Memory Size (MB)"
+      LambdaTimeout:
+        default: "Lambda Timeout (seconds)"
+
+Parameters:
+  SarApplicationId:
+    Type: String
+    Description: "SAR ApplicationId ARN (arn:aws:serverlessrepo:REGION:ACCOUNT:applications/NAME)"
+    Default: "arn:aws:serverlessrepo:us-east-1:637423296378:applications/wpsuite-flow"
+    AllowedPattern: ^arn:aws:serverlessrepo:.*:applications\/.*$
+    ConstraintDescription: "Must be a valid Serverless Application Repository ApplicationId ARN"
+
+  SarSemanticVersion:
+    Type: String
+    Description: "SAR semantic version to deploy (e.g. 1.0.3)"
+    Default: "1.0.3"
+    AllowedPattern: ^\d+\.\d+\.\d+$
+    ConstraintDescription: "Must be a semantic version like 1.0.3"
+
+  # ---- pass-through parameters for the SAR app ----
+
+  # Core Application Settings
+  AppName:
+    Type: String
+    Default: wpsflow
+    Description: "Application name for resource naming (alphanumeric and hyphens only)"
+
+  Environment:
+    Type: String
+    Default: prod
+    AllowedValues: [dev, staging, prod]
+    Description: "Deployment environment"
+
+  DeploymentVersion:
+    Type: String
+    Default: "1.0.3"
+    Description: "Version string for deployment tracking"
+
+  # Authentication Configuration
+  FrontendApiAuthMode:
+    Type: String
+    Default: NONE
+    AllowedValues: [NONE, IAM]
+    Description: "Authentication mode for frontend endpoints (form submissions)"
+
+  AdminApiAuthMode:
+    Type: String
+    Default: COGNITO
+    AllowedValues: [NONE, IAM, COGNITO]
+    Description: "Authentication mode for admin endpoints"
+
+  AdminCognitoUserPoolId:
+    Type: String
+    Default: ""
+    Description: "Cognito User Pool ID for admin authentication (required if AdminApiAuthMode=COGNITO)"
+
+  AdminCognitoAuthScopes:
+    Type: CommaDelimitedList
+    Default: ""
+    Description: "Comma-separated OAuth scopes for admin endpoints (e.g., email,openid,profile)"
+
+  # reCAPTCHA Configuration
+  EnableRecaptcha:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: "Enable Google reCAPTCHA protection for frontend form submissions"
+
+  RecaptchaMode:
+    Type: String
+    Default: classic
+    AllowedValues: [classic, enterprise]
+    Description: "reCAPTCHA version: Classic (v2/v3) or Enterprise"
+
+  RecaptchaSecretKey:
+    Type: String
+    Default: ""
+    NoEcho: true
+    Description: "reCAPTCHA secret key from Google (encrypted in SSM Parameter Store)"
+
+  RecaptchaProjectId:
+    Type: String
+    Default: ""
+    Description: "Google Cloud project ID for reCAPTCHA Enterprise"
+
+  RecaptchaSiteKey:
+    Type: String
+    Default: ""
+    Description: "reCAPTCHA site key for Enterprise mode"
+
+  RecaptchaScoreThreshold:
+    Type: Number
+    Default: 0.5
+    MinValue: 0
+    MaxValue: 1
+    Description: "Minimum reCAPTCHA score threshold (0.0-1.0, higher = more strict)"
+
+  # WAF Configuration
+  EnableWAF:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: "Enable AWS WAF protection for API endpoints"
+
+  PublicAllowedIPs:
+    Type: CommaDelimitedList
+    Default: ""
+    Description: "CIDR ranges allowed for frontend endpoints (e.g., 1.2.3.0/24). Empty = allow all."
+
+  AdminAllowedIPs:
+    Type: CommaDelimitedList
+    Default: ""
+    Description: "CIDR ranges allowed for admin endpoints (e.g., 10.0.0.0/8). Empty = allow all."
+
+  BlockedIPs:
+    Type: CommaDelimitedList
+    Default: ""
+    Description: "CIDR ranges to block for all endpoints (e.g., 192.168.1.0/24)"
+
+  EnableKmsForSecrets:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: "Create a dedicated KMS key for encrypting secrets in SSM Parameter Store"
+
+  # Storage Configuration
+  TemplatesBucketName:
+    Type: String
+    Default: ""
+    Description: "Existing S3 bucket name for email templates. Leave empty to create a new bucket."
+
+  PayloadBucketName:
+    Type: String
+    Default: ""
+    Description: "Existing S3 bucket name for file uploads. Leave empty to create a new bucket."
+
+  TemplatesPrefix:
+    Type: String
+    Default: templates/
+    Description: "S3 prefix for organizing email template files"
+
+  # Email Configuration
+  FromEmail:
+    Type: String
+    Default: ""
+    Description: "Email address for sending notifications (must be verified in AWS SES)"
+
+  DefaultWebhookSigningSecret:
+    Type: String
+    Default: ""
+    NoEcho: true
+    Description: "Optional HMAC secret for signing webhook payloads"
+
+  # Data Retention
+  DataRetentionDays:
+    Type: Number
+    Default: 30
+    MinValue: 1
+    MaxValue: 365
+    Description: "Days to keep submission data in DynamoDB before automatic deletion"
+
+  LogRetentionDays:
+    Type: Number
+    Default: 14
+    MinValue: 1
+    MaxValue: 365
+    Description: "Days to keep CloudWatch logs"
+
+  # Performance Configuration
+  LambdaMemorySize:
+    Type: Number
+    Default: 1024
+    MinValue: 128
+    MaxValue: 10240
+    Description: "Memory allocated to Lambda functions (MB)"
+
+  LambdaTimeout:
+    Type: Number
+    Default: 30
+    MinValue: 3
+    MaxValue: 900
+    Description: "Maximum execution time for Lambda functions (seconds)"
+
+Resources:
+  FlowBackend:
+    Type: AWS::Serverless::Application
+    Properties:
+      Location:
+        ApplicationId: !Ref SarApplicationId
+        SemanticVersion: !Ref SarSemanticVersion
+      Parameters:
+        # Core Application Settings
+        AppName: !Ref AppName
+        Environment: !Ref Environment
+        DeploymentVersion: !Ref DeploymentVersion
+
+        # Authentication Configuration
+        FrontendApiAuthMode: !Ref FrontendApiAuthMode
+        AdminApiAuthMode: !Ref AdminApiAuthMode
+        AdminCognitoUserPoolId: !Ref AdminCognitoUserPoolId
+        AdminCognitoAuthScopes: !Join [",", !Ref AdminCognitoAuthScopes]
+
+        # reCAPTCHA Configuration
+        EnableRecaptcha: !Ref EnableRecaptcha
+        RecaptchaMode: !Ref RecaptchaMode
+        RecaptchaSecretKey: !Ref RecaptchaSecretKey
+        RecaptchaProjectId: !Ref RecaptchaProjectId
+        RecaptchaSiteKey: !Ref RecaptchaSiteKey
+        RecaptchaScoreThreshold: !Ref RecaptchaScoreThreshold
+
+        # WAF Configuration
+        EnableWAF: !Ref EnableWAF
+        PublicAllowedIPs: !Join [",", !Ref PublicAllowedIPs]
+        AdminAllowedIPs: !Join [",", !Ref AdminAllowedIPs]
+        BlockedIPs: !Join [",", !Ref BlockedIPs]
+
+        # Security
+        EnableKmsForSecrets: !Ref EnableKmsForSecrets
+
+        # Storage Configuration
+        TemplatesBucketName: !Ref TemplatesBucketName
+        PayloadBucketName: !Ref PayloadBucketName
+        TemplatesPrefix: !Ref TemplatesPrefix
+
+        # Email Configuration
+        FromEmail: !Ref FromEmail
+        DefaultWebhookSigningSecret: !Ref DefaultWebhookSigningSecret
+
+        # Data Retention
+        DataRetentionDays: !Ref DataRetentionDays
+        LogRetentionDays: !Ref LogRetentionDays
+
+        # Performance Configuration
+        LambdaMemorySize: !Ref LambdaMemorySize
+        LambdaTimeout: !Ref LambdaTimeout
+
+Outputs:
+  ApiUrl:
+    Description: "Base URL for the Flow API"
+    Value: !GetAtt FlowBackend.Outputs.ApiUrl
+
+  TemplatesBucketOutput:
+    Description: "S3 bucket for email templates"
+    Value: !GetAtt FlowBackend.Outputs.TemplatesBucketOutput
+
+  PayloadBucketOutput:
+    Description: "S3 bucket for file uploads"
+    Value: !GetAtt FlowBackend.Outputs.PayloadBucketOutput

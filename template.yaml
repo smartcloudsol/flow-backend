@@ -1,0 +1,808 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: WP Suite Flow backend with forms API, templates, workflows, email, webhook, WAF and reCAPTCHA support
+
+Metadata:
+  AWS::ServerlessRepo::Application:
+    Name: WP Suite Flow Backend
+    Description: Event-driven forms, submissions, email templates, and workflow automation backend for WordPress sites using WP Suite Flow
+    Author: Smart Cloud Solutions
+    SpdxLicenseId: MIT
+    LicenseUrl: s3://wpsuite-artifacts/wpsuite-flow/${DeploymentVersion}/docs/LICENSE
+    ReadmeUrl: s3://wpsuite-artifacts/wpsuite-flow/${DeploymentVersion}/docs/SAR-README.md
+    Labels:
+      [
+        wordpress,
+        forms,
+        workflow-automation,
+        eventbridge,
+        email,
+        webhooks,
+        dynamodb,
+        serverless,
+      ]
+    HomePageUrl: https://wpsuite.io/flow/
+    SemanticVersion: ${DeploymentVersion}
+
+Parameters:
+  AppName:
+    Type: String
+    Default: wpsuite-flow
+  Environment:
+    Type: String
+    Default: prod
+    AllowedValues: [dev, staging, prod]
+  DeploymentVersion:
+    Type: String
+    Default: 1.0.0
+  FrontendApiAuthMode:
+    Type: String
+    Default: NONE
+    AllowedValues: [NONE, IAM]
+  AdminApiAuthMode:
+    Type: String
+    Default: COGNITO
+    AllowedValues: [NONE, IAM, COGNITO]
+  AdminCognitoUserPoolId:
+    Type: String
+    Default: ""
+  AdminCognitoAuthScopes:
+    Type: CommaDelimitedList
+    Default: ""
+  EnableRecaptcha:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+  RecaptchaMode:
+    Type: String
+    Default: classic
+    AllowedValues: [classic, enterprise]
+  RecaptchaProjectId:
+    Type: String
+    Default: ""
+  RecaptchaSiteKey:
+    Type: String
+    Default: ""
+  RecaptchaSecretKey:
+    Type: String
+    Default: ""
+    NoEcho: true
+  RecaptchaScoreThreshold:
+    Type: Number
+    Default: 0.5
+  EnableWAF:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+  PublicAllowedIPs:
+    Type: CommaDelimitedList
+    Default: ""
+  AdminAllowedIPs:
+    Type: CommaDelimitedList
+    Default: ""
+  BlockedIPs:
+    Type: CommaDelimitedList
+    Default: ""
+  EnableKmsForSecrets:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+  DataRetentionDays:
+    Type: Number
+    Default: 30
+  LogRetentionDays:
+    Type: Number
+    Default: 14
+  LambdaMemorySize:
+    Type: Number
+    Default: 1024
+  LambdaTimeout:
+    Type: Number
+    Default: 30
+  LogLevel:
+    Type: String
+    Default: INFO
+    AllowedValues: [DEBUG, INFO, WARN, ERROR]
+  TemplatesBucketName:
+    Type: String
+    Default: ""
+  PayloadBucketName:
+    Type: String
+    Default: ""
+  TemplatesPrefix:
+    Type: String
+    Default: templates/
+  FromEmail:
+    Type: String
+    Default: ""
+  DefaultWebhookSigningSecret:
+    Type: String
+    Default: ""
+    NoEcho: true
+
+Conditions:
+  EnableRecaptchaProtection: !Equals [!Ref EnableRecaptcha, "true"]
+  WAFEnabled: !Equals [!Ref EnableWAF, "true"]
+  HasPublicAllowedIPs:
+    !And [
+      !Condition WAFEnabled,
+      !Not [!Equals [!Join ["", !Ref PublicAllowedIPs], ""]],
+    ]
+  HasAdminAllowedIPs:
+    !And [
+      !Condition WAFEnabled,
+      !Not [!Equals [!Join ["", !Ref AdminAllowedIPs], ""]],
+    ]
+  HasBlockedIPs:
+    !And [
+      !Condition WAFEnabled,
+      !Not [!Equals [!Join ["", !Ref BlockedIPs], ""]],
+    ]
+  UseAdminCognito:
+    !And [
+      !Equals [!Ref AdminApiAuthMode, "COGNITO"],
+      !Not [!Equals [!Ref AdminCognitoUserPoolId, ""]],
+    ]
+  UseProvidedTemplatesBucket: !Not [!Equals [!Ref TemplatesBucketName, ""]]
+  CreateTemplatesBucket: !Equals [!Ref TemplatesBucketName, ""]
+  UseProvidedPayloadBucket: !Not [!Equals [!Ref PayloadBucketName, ""]]
+  CreatePayloadBucket: !Equals [!Ref PayloadBucketName, ""]
+  CreateKmsKey: !Equals [!Ref EnableKmsForSecrets, "true"]
+  HasDefaultWebhookSigningSecret:
+    !Not [!Equals [!Ref DefaultWebhookSigningSecret, ""]]
+
+Globals:
+  Function:
+    Runtime: nodejs24.x
+    Architectures: [arm64]
+    MemorySize: !Ref LambdaMemorySize
+    Timeout: !Ref LambdaTimeout
+    Tracing: Active
+    Environment:
+      Variables:
+        APP_NAME: !Ref AppName
+        ENVIRONMENT: !Ref Environment
+        EVENT_BUS_NAME: default
+        SUBMISSIONS_TABLE: !Ref SubmissionsTable
+        SUBMISSION_EVENTS_TABLE: !Ref SubmissionEventsTable
+        TEMPLATES_TABLE: !Ref TemplatesTable
+        WORKFLOW_DEFINITIONS_TABLE: !Ref WorkflowDefinitionsTable
+        FORM_DEFINITIONS_TABLE: !Ref FormDefinitionsTable
+        WEBHOOK_ENDPOINTS_TABLE: !Ref WebhookEndpointsTable
+        ENABLE_RECAPTCHA: !Ref EnableRecaptcha
+        RECAPTCHA_MODE: !Ref RecaptchaMode
+        RECAPTCHA_PROJECT_ID: !Ref RecaptchaProjectId
+        RECAPTCHA_SITE_KEY: !Ref RecaptchaSiteKey
+        RECAPTCHA_SCORE_THRESHOLD: !Ref RecaptchaScoreThreshold
+        TEMPLATES_BUCKET:
+          !If [
+            UseProvidedTemplatesBucket,
+            !Ref TemplatesBucketName,
+            !Ref TemplatesBucket,
+          ]
+        PAYLOAD_BUCKET:
+          !If [
+            UseProvidedPayloadBucket,
+            !Ref PayloadBucketName,
+            !Ref PayloadBucket,
+          ]
+        TEMPLATES_PREFIX: !Ref TemplatesPrefix
+        FROM_EMAIL: !Ref FromEmail
+        LOG_LEVEL: !Ref LogLevel
+        DATA_RETENTION_DAYS: !Ref DataRetentionDays
+
+Resources:
+  RestApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub "${AppName}-${Environment}-api"
+      Description: !Sub "${AppName}-${Environment} WP Suite Flow API"
+      EndpointConfiguration:
+        Types: [REGIONAL]
+
+  AdminAuthorizer:
+    Type: AWS::ApiGateway::Authorizer
+    Condition: UseAdminCognito
+    Properties:
+      Name: !Sub "${AppName}-${Environment}-admin-cognito-authorizer"
+      RestApiId: !Ref RestApi
+      Type: COGNITO_USER_POOLS
+      IdentitySource: method.request.header.Authorization
+      ProviderARNs:
+        - !Sub "arn:${AWS::Partition}:cognito-idp:${AWS::Region}:${AWS::AccountId}:userpool/${AdminCognitoUserPoolId}"
+
+  DeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${AppName}-${Environment}-dlq"
+      MessageRetentionPeriod: 1209600
+
+  TemplatesBucket:
+    Type: AWS::S3::Bucket
+    Condition: CreateTemplatesBucket
+    Properties:
+      BucketName: !Sub "${AppName}-${Environment}-templates-${AWS::AccountId}"
+      VersioningConfiguration: { Status: Enabled }
+
+  PayloadBucket:
+    Type: AWS::S3::Bucket
+    Condition: CreatePayloadBucket
+    Properties:
+      BucketName: !Sub "${AppName}-${Environment}-payloads-${AWS::AccountId}"
+      VersioningConfiguration: { Status: Enabled }
+
+  SecretsKmsKey:
+    Type: AWS::KMS::Key
+    Condition: CreateKmsKey
+    Properties:
+      Description: !Sub "${AppName}-${Environment} secrets key"
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: EnableRootPermissions
+            Effect: Allow
+            Principal:
+              { AWS: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:root" }
+            Action: "kms:*"
+            Resource: "*"
+          - Sid: AllowSsmUse
+            Effect: Allow
+            Principal: { Service: ssm.amazonaws.com }
+            Action:
+              [kms:Decrypt, kms:Encrypt, kms:GenerateDataKey, kms:DescribeKey]
+            Resource: "*"
+
+  SecretsKmsAlias:
+    Type: AWS::KMS::Alias
+    Condition: CreateKmsKey
+    Properties:
+      AliasName: !Sub "alias/${AppName}-${Environment}-secrets"
+      TargetKeyId: !Ref SecretsKmsKey
+
+  SubmissionsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${AppName}-${Environment}-submissions"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: PK, AttributeType: S }
+        - { AttributeName: SK, AttributeType: S }
+        - { AttributeName: GSI1PK, AttributeType: S }
+        - { AttributeName: GSI1SK, AttributeType: S }
+        - { AttributeName: GSI2PK, AttributeType: S }
+        - { AttributeName: GSI2SK, AttributeType: S }
+        - { AttributeName: GSI3PK, AttributeType: S }
+        - { AttributeName: GSI3SK, AttributeType: S }
+      KeySchema:
+        - { AttributeName: PK, KeyType: HASH }
+        - { AttributeName: SK, KeyType: RANGE }
+      GlobalSecondaryIndexes:
+        - IndexName: GSI1
+          KeySchema:
+            - { AttributeName: GSI1PK, KeyType: HASH }
+            - { AttributeName: GSI1SK, KeyType: RANGE }
+          Projection: { ProjectionType: ALL }
+        - IndexName: GSI2
+          KeySchema:
+            - { AttributeName: GSI2PK, KeyType: HASH }
+            - { AttributeName: GSI2SK, KeyType: RANGE }
+          Projection: { ProjectionType: ALL }
+        - IndexName: GSI3
+          KeySchema:
+            - { AttributeName: GSI3PK, KeyType: HASH }
+            - { AttributeName: GSI3SK, KeyType: RANGE }
+          Projection: { ProjectionType: ALL }
+      TimeToLiveSpecification:
+        AttributeName: expiresAt
+        Enabled: true
+
+  SubmissionEventsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${AppName}-${Environment}-submission-events"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: PK, AttributeType: S }
+        - { AttributeName: SK, AttributeType: S }
+      KeySchema:
+        - { AttributeName: PK, KeyType: HASH }
+        - { AttributeName: SK, KeyType: RANGE }
+
+  TemplatesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${AppName}-${Environment}-templates"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: PK, AttributeType: S }
+        - { AttributeName: SK, AttributeType: S }
+        - { AttributeName: GSI1PK, AttributeType: S }
+        - { AttributeName: GSI1SK, AttributeType: S }
+      KeySchema:
+        - { AttributeName: PK, KeyType: HASH }
+        - { AttributeName: SK, KeyType: RANGE }
+      GlobalSecondaryIndexes:
+        - IndexName: GSI1
+          KeySchema:
+            - { AttributeName: GSI1PK, KeyType: HASH }
+            - { AttributeName: GSI1SK, KeyType: RANGE }
+          Projection: { ProjectionType: ALL }
+
+  WorkflowDefinitionsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${AppName}-${Environment}-workflow-definitions"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: PK, AttributeType: S }
+        - { AttributeName: SK, AttributeType: S }
+        - { AttributeName: GSI1PK, AttributeType: S }
+        - { AttributeName: GSI1SK, AttributeType: S }
+      KeySchema:
+        - { AttributeName: PK, KeyType: HASH }
+        - { AttributeName: SK, KeyType: RANGE }
+      GlobalSecondaryIndexes:
+        - IndexName: GSI1
+          KeySchema:
+            - { AttributeName: GSI1PK, KeyType: HASH }
+            - { AttributeName: GSI1SK, KeyType: RANGE }
+          Projection: { ProjectionType: ALL }
+
+  FormDefinitionsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${AppName}-${Environment}-form-definitions"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: PK, AttributeType: S }
+        - { AttributeName: SK, AttributeType: S }
+        - { AttributeName: GSI1PK, AttributeType: S }
+        - { AttributeName: GSI1SK, AttributeType: S }
+      KeySchema:
+        - { AttributeName: PK, KeyType: HASH }
+        - { AttributeName: SK, KeyType: RANGE }
+      GlobalSecondaryIndexes:
+        - IndexName: GSI1
+          KeySchema:
+            - { AttributeName: GSI1PK, KeyType: HASH }
+            - { AttributeName: GSI1SK, KeyType: RANGE }
+          Projection: { ProjectionType: ALL }
+
+  WebhookEndpointsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${AppName}-${Environment}-webhook-endpoints"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: PK, AttributeType: S }
+        - { AttributeName: SK, AttributeType: S }
+        - { AttributeName: GSI1PK, AttributeType: S }
+        - { AttributeName: GSI1SK, AttributeType: S }
+      KeySchema:
+        - { AttributeName: PK, KeyType: HASH }
+        - { AttributeName: SK, KeyType: RANGE }
+      GlobalSecondaryIndexes:
+        - IndexName: GSI1
+          KeySchema:
+            - { AttributeName: GSI1PK, KeyType: HASH }
+            - { AttributeName: GSI1SK, KeyType: RANGE }
+          Projection: { ProjectionType: ALL }
+
+  CustomResourceManagerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AppName}-${Environment}-custom-resource-manager"
+      RetentionInDays: !Ref LogRetentionDays
+
+  CustomResourceManagerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${AppName}-${Environment}-custom-resource-manager"
+      CodeUri:
+        Bucket: wpsuite-artifacts
+        Key: wpsuite-flow/${DeploymentVersion}/functions/custom-resource.zip
+      Handler: index.handler
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - ssm:PutParameter
+                - ssm:DeleteParameter
+                - ssm:GetParameter
+                - wafv2:AssociateWebACL
+                - wafv2:DisassociateWebACL
+                - wafv2:CreateIPSet
+                - wafv2:GetIPSet
+                - wafv2:UpdateIPSet
+                - wafv2:DeleteIPSet
+                - wafv2:CreateWebACL
+                - wafv2:GetWebACL
+                - wafv2:UpdateWebACL
+                - wafv2:DeleteWebACL
+                - wafv2:TagResource
+                - wafv2:UntagResource
+                - apigateway:*
+              Resource: "*"
+        - !If
+          - CreateKmsKey
+          - Statement:
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:DescribeKey
+                  - kms:Encrypt
+                  - kms:GenerateDataKey
+                Resource: !GetAtt SecretsKmsKey.Arn
+          - !Ref AWS::NoValue
+
+  RecaptchaSecretParameter:
+    Type: Custom::SSMParameter
+    Condition: EnableRecaptchaProtection
+    Properties:
+      ServiceToken: !GetAtt CustomResourceManagerFunction.Arn
+      Name: !Sub "/${AppName}/${Environment}/recaptcha/secret"
+      Value: !Ref RecaptchaSecretKey
+      KeyId: !If [CreateKmsKey, !Ref SecretsKmsKey, !Ref "AWS::NoValue"]
+
+  DefaultWebhookSigningSecretParameter:
+    Type: Custom::SSMParameter
+    Condition: HasDefaultWebhookSigningSecret
+    Properties:
+      ServiceToken: !GetAtt CustomResourceManagerFunction.Arn
+      Name: !Sub "/${AppName}/${Environment}/webhook/default-signing-secret"
+      Value: !Ref DefaultWebhookSigningSecret
+      KeyId: !If [CreateKmsKey, !Ref SecretsKmsKey, !Ref "AWS::NoValue"]
+
+  PublicAllowedIpSet:
+    Type: Custom::WafIPSet
+    Condition: HasPublicAllowedIPs
+    Properties:
+      ServiceToken: !GetAtt CustomResourceManagerFunction.Arn
+      Name: !Sub "${AppName}-${Environment}-public-allow"
+      Scope: REGIONAL
+      IPAddressVersion: IPV4
+      Addresses: !Join [",", !Ref PublicAllowedIPs]
+
+  AdminAllowedIpSet:
+    Type: Custom::WafIPSet
+    Condition: HasAdminAllowedIPs
+    Properties:
+      ServiceToken: !GetAtt CustomResourceManagerFunction.Arn
+      Name: !Sub "${AppName}-${Environment}-admin-allow"
+      Scope: REGIONAL
+      IPAddressVersion: IPV4
+      Addresses: !Join [",", !Ref AdminAllowedIPs]
+
+  BlockedIpSet:
+    Type: Custom::WafIPSet
+    Condition: HasBlockedIPs
+    Properties:
+      ServiceToken: !GetAtt CustomResourceManagerFunction.Arn
+      Name: !Sub "${AppName}-${Environment}-blocked"
+      Scope: REGIONAL
+      IPAddressVersion: IPV4
+      Addresses: !Join [",", !Ref BlockedIPs]
+
+  WebAcl:
+    Type: Custom::WafWebACL
+    Condition: WAFEnabled
+    Properties:
+      ServiceToken: !GetAtt CustomResourceManagerFunction.Arn
+      Name: !Sub "${AppName}-${Environment}-webacl"
+      Description: "WAF protection for WP Suite Flow API"
+      Scope: REGIONAL
+      DefaultAction:
+        Allow: {}
+      VisibilityConfig:
+        SampledRequestsEnabled: true
+        CloudWatchMetricsEnabled: true
+        MetricName: !Sub "${AppName}-${Environment}-webacl"
+      Rules:
+        - !If
+          - HasBlockedIPs
+          - Name: BlockedIPs
+            Priority: 1
+            Action:
+              Block: {}
+            Statement:
+              IPSetReferenceStatement:
+                ARN: !GetAtt BlockedIpSet.Arn
+            VisibilityConfig:
+              SampledRequestsEnabled: true
+              CloudWatchMetricsEnabled: true
+              MetricName: blocked-ips
+          - !Ref AWS::NoValue
+        - !If
+          - HasPublicAllowedIPs
+          - Name: PublicAllowList
+            Priority: 2
+            Action:
+              Allow: {}
+            Statement:
+              IPSetReferenceStatement:
+                ARN: !GetAtt PublicAllowedIpSet.Arn
+            VisibilityConfig:
+              SampledRequestsEnabled: true
+              CloudWatchMetricsEnabled: true
+              MetricName: public-allow
+          - !Ref AWS::NoValue
+        - !If
+          - HasAdminAllowedIPs
+          - Name: AdminAllowList
+            Priority: 3
+            Action:
+              Allow: {}
+            Statement:
+              IPSetReferenceStatement:
+                ARN: !GetAtt AdminAllowedIpSet.Arn
+            VisibilityConfig:
+              SampledRequestsEnabled: true
+              CloudWatchMetricsEnabled: true
+              MetricName: admin-allow
+          - !Ref AWS::NoValue
+        - Name: AwsManagedCommon
+          Priority: 10
+          OverrideAction:
+            Count: {}
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesCommonRuleSet
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: aws-common
+        - Name: RateLimit
+          Priority: 20
+          Action:
+            Block: {}
+          Statement:
+            RateBasedStatement:
+              Limit: 1000
+              AggregateKeyType: IP
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: rate-limit
+
+  WebAclAssociation:
+    Type: Custom::WafAssociation
+    Condition: WAFEnabled
+    Properties:
+      ServiceToken: !GetAtt CustomResourceManagerFunction.Arn
+      WebACLArn: !GetAtt WebAcl.Arn
+      ResourceArn: !Sub "arn:${AWS::Partition}:apigateway:${AWS::Region}::/restapis/${RestApi}/stages/prod"
+
+  FormsApiLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AppName}-${Environment}-forms-api"
+      RetentionInDays: !Ref LogRetentionDays
+
+  FormsApiFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${AppName}-${Environment}-forms-api"
+      CodeUri:
+        Bucket: wpsuite-artifacts
+        Key: wpsuite-flow/${DeploymentVersion}/functions/forms-api.zip
+      Handler: index.handler
+      DeadLetterQueue: { Type: SQS, TargetArn: !GetAtt DeadLetterQueue.Arn }
+      Policies:
+        - DynamoDBCrudPolicy: { TableName: !Ref SubmissionsTable }
+        - DynamoDBCrudPolicy: { TableName: !Ref SubmissionEventsTable }
+        - DynamoDBCrudPolicy: { TableName: !Ref TemplatesTable }
+        - DynamoDBCrudPolicy: { TableName: !Ref WorkflowDefinitionsTable }
+        - DynamoDBCrudPolicy: { TableName: !Ref FormDefinitionsTable }
+        - DynamoDBCrudPolicy: { TableName: !Ref WebhookEndpointsTable }
+        - S3CrudPolicy:
+            {
+              BucketName:
+                !If [
+                  UseProvidedTemplatesBucket,
+                  !Ref TemplatesBucketName,
+                  !Ref TemplatesBucket,
+                ],
+            }
+        - S3CrudPolicy:
+            {
+              BucketName:
+                !If [
+                  UseProvidedPayloadBucket,
+                  !Ref PayloadBucketName,
+                  !Ref PayloadBucket,
+                ],
+            }
+        - Statement:
+            - Effect: Allow
+              Action: [events:PutEvents, ssm:GetParameter]
+              Resource: "*"
+        - !If
+          - CreateKmsKey
+          - Statement:
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:DescribeKey
+                  - kms:Encrypt
+                  - kms:GenerateDataKey
+                Resource: !GetAtt SecretsKmsKey.Arn
+          - !Ref AWS::NoValue
+      Environment:
+        Variables:
+          RECAPTCHA_SECRET_PARAMETER_NAME:
+            !If [EnableRecaptchaProtection, !Ref RecaptchaSecretParameter, ""]
+          DEFAULT_WEBHOOK_SIGNING_SECRET_PARAMETER_NAME:
+            !If [
+              HasDefaultWebhookSigningSecret,
+              !Ref DefaultWebhookSigningSecretParameter,
+              "",
+            ]
+
+  FormsApiInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref FormsApiFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${RestApi}/*/*/*"
+
+  ApiRoutes:
+    Type: Custom::ApiRoutes
+    DependsOn:
+      - FormsApiFunction
+      - FormsApiInvokePermission
+    Properties:
+      ServiceToken: !GetAtt CustomResourceManagerFunction.Arn
+      RestApiId: !Ref RestApi
+      StageName: prod
+      FormsApiIntegrationUri: !Sub "arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${FormsApiFunction.Arn}/invocations"
+      FrontendAuthMode: !Ref FrontendApiAuthMode
+      AdminAuthMode: !Ref AdminApiAuthMode
+      AdminAuthorizerId: !If [UseAdminCognito, !Ref AdminAuthorizer, ""]
+      AdminAuthorizationScopes: !Join [",", !Ref AdminCognitoAuthScopes]
+
+  WorkflowDispatcherLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AppName}-${Environment}-workflow-dispatcher"
+      RetentionInDays: !Ref LogRetentionDays
+
+  WorkflowDispatcherFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${AppName}-${Environment}-workflow-dispatcher"
+      CodeUri:
+        Bucket: wpsuite-artifacts
+        Key: wpsuite-flow/${DeploymentVersion}/functions/workflow-dispatcher.zip
+      Handler: index.handler
+      DeadLetterQueue: { Type: SQS, TargetArn: !GetAtt DeadLetterQueue.Arn }
+      Policies:
+        - DynamoDBCrudPolicy: { TableName: !Ref SubmissionsTable }
+        - DynamoDBReadPolicy: { TableName: !Ref WorkflowDefinitionsTable }
+        - DynamoDBReadPolicy: { TableName: !Ref FormDefinitionsTable }
+        - DynamoDBCrudPolicy: { TableName: !Ref SubmissionEventsTable }
+        - DynamoDBReadPolicy: { TableName: !Ref WebhookEndpointsTable }
+        - Statement:
+            - Effect: Allow
+              Action: [events:PutEvents]
+              Resource: "*"
+      Events:
+        SubmissionEvents:
+          Type: EventBridgeRule
+          Properties:
+            Pattern:
+              source: [wpsuite.forms]
+              detail-type:
+                [
+                  submission.created,
+                  submission.updated,
+                  submission.status-changed,
+                  submission.action-invoked,
+                ]
+
+  EmailSenderLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AppName}-${Environment}-email-sender"
+      RetentionInDays: !Ref LogRetentionDays
+
+  EmailSenderFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${AppName}-${Environment}-email-sender"
+      CodeUri:
+        Bucket: wpsuite-artifacts
+        Key: wpsuite-flow/${DeploymentVersion}/functions/email-sender.zip
+      Handler: index.handler
+      DeadLetterQueue: { Type: SQS, TargetArn: !GetAtt DeadLetterQueue.Arn }
+      Policies:
+        - DynamoDBReadPolicy: { TableName: !Ref TemplatesTable }
+        - DynamoDBCrudPolicy: { TableName: !Ref SubmissionEventsTable }
+        - S3ReadPolicy:
+            {
+              BucketName:
+                !If [
+                  UseProvidedTemplatesBucket,
+                  !Ref TemplatesBucketName,
+                  !Ref TemplatesBucket,
+                ],
+            }
+        - Statement:
+            - Effect: Allow
+              Action: [ses:SendEmail, events:PutEvents]
+              Resource: "*"
+      Events:
+        EmailRequested:
+          Type: EventBridgeRule
+          Properties:
+            Pattern:
+              source: [wpsuite.forms]
+              detail-type: [email.requested]
+
+  WebhookDispatcherLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AppName}-${Environment}-webhook-dispatcher"
+      RetentionInDays: !Ref LogRetentionDays
+
+  WebhookDispatcherFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${AppName}-${Environment}-webhook-dispatcher"
+      CodeUri:
+        Bucket: wpsuite-artifacts
+        Key: wpsuite-flow/${DeploymentVersion}/functions/webhook-dispatcher.zip
+      Handler: index.handler
+      DeadLetterQueue: { Type: SQS, TargetArn: !GetAtt DeadLetterQueue.Arn }
+      Policies:
+        - DynamoDBCrudPolicy: { TableName: !Ref SubmissionEventsTable }
+        - DynamoDBReadPolicy: { TableName: !Ref WebhookEndpointsTable }
+        - Statement:
+            - Effect: Allow
+              Action: [ssm:GetParameter, events:PutEvents]
+              Resource: "*"
+        - !If
+          - CreateKmsKey
+          - Statement:
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:DescribeKey
+                  - kms:Encrypt
+                  - kms:GenerateDataKey
+                Resource: !GetAtt SecretsKmsKey.Arn
+          - !Ref AWS::NoValue
+      Events:
+        WebhookRequested:
+          Type: EventBridgeRule
+          Properties:
+            Pattern:
+              source: [wpsuite.forms]
+              detail-type: [integration.webhook.requested]
+      Environment:
+        Variables:
+          DEFAULT_WEBHOOK_SIGNING_SECRET_PARAMETER_NAME:
+            !If [
+              HasDefaultWebhookSigningSecret,
+              !Ref DefaultWebhookSigningSecretParameter,
+              "",
+            ]
+
+Outputs:
+  ApiUrl:
+    Value: !Sub "https://${RestApi}.execute-api.${AWS::Region}.amazonaws.com/prod"
+  TemplatesBucketOutput:
+    Value:
+      !If [
+        UseProvidedTemplatesBucket,
+        !Ref TemplatesBucketName,
+        !Ref TemplatesBucket,
+      ]
+  PayloadBucketOutput:
+    Value:
+      !If [UseProvidedPayloadBucket, !Ref PayloadBucketName, !Ref PayloadBucket]
+  RecaptchaSecretParameterName:
+    Condition: EnableRecaptchaProtection
+    Value: !Ref RecaptchaSecretParameter

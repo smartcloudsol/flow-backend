@@ -1,0 +1,1734 @@
+openapi: 3.0.3
+info:
+  title: WP Suite Flow Backend API
+  version: 1.0.2
+  description: |
+    AWS-native forms and workflow backend for WordPress sites using WP Suite.
+
+    This API provides comprehensive form submission management, workflow automation,
+    email templating, and webhook integration capabilities.
+
+    ## Authentication
+
+    - **Frontend API** (`/frontend/*`): Configurable authentication (NONE or IAM)
+    - **Admin API** (`/admin/*`): Configurable authentication (NONE, IAM, or Cognito)
+
+    ## Security
+
+    - reCAPTCHA protection (optional) for frontend endpoints
+    - AWS WAF protection (optional)
+    - IP allowlisting/blocklisting support
+
+  contact:
+    name: Smart Cloud Solutions
+    url: https://wpsuite.io/
+  license:
+    name: MIT
+    url: https://opensource.org/licenses/MIT
+
+servers:
+  - url: https://{apiId}.execute-api.{region}.amazonaws.com/prod
+    description: API Gateway endpoint
+    variables:
+      apiId:
+        default: example
+        description: API Gateway REST API ID
+      region:
+        default: us-east-1
+        description: AWS Region
+
+tags:
+  - name: Frontend
+    description: Public endpoints for form submissions
+  - name: Admin - Forms
+    description: Form definition management
+  - name: Admin - Submissions
+    description: Submission management and querying
+  - name: Admin - Templates
+    description: Email template management
+  - name: Admin - Workflows
+    description: Workflow definition management
+  - name: Admin - Webhooks
+    description: Webhook endpoint configuration
+
+paths:
+  /frontend/forms/{formId}/submit:
+    post:
+      tags:
+        - Frontend
+      summary: Submit a form
+      description: |
+        Submit form data from a public-facing WordPress form. Supports reCAPTCHA verification,
+        file uploads via payload references, and automatic email notifications.
+      operationId: submitFrontendForm
+      parameters:
+        - name: formId
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Form definition ID
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - accountId
+                - siteId
+                - fields
+              properties:
+                accountId:
+                  type: string
+                  description: WP Suite account identifier
+                siteId:
+                  type: string
+                  description: WordPress site identifier
+                fields:
+                  type: object
+                  additionalProperties: true
+                  description: Form field data (key-value pairs)
+                  example:
+                    name: John Doe
+                    email: john@example.com
+                    message: Hello world
+                recaptchaToken:
+                  type: string
+                  description: reCAPTCHA token (required if reCAPTCHA is enabled)
+                payloadRef:
+                  type: object
+                  description: Reference to uploaded file payload (for large submissions)
+                  properties:
+                    bucket:
+                      type: string
+                    key:
+                      type: string
+                    contentType:
+                      type: string
+                    size:
+                      type: integer
+                context:
+                  type: object
+                  description: Additional context metadata
+                  additionalProperties: true
+      responses:
+        "200":
+          description: Submission accepted
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  submissionId:
+                    type: string
+                  status:
+                    type: string
+                    example: new
+                  message:
+                    type: string
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /frontend/forms/{formId}/drafts:
+    post:
+      tags:
+        - Frontend
+      summary: Create or update a draft
+      description: |
+        Create a new draft submission or update an existing draft for a public-facing form.
+        Draft saves are intentionally more permissive than final submission and must not trigger
+        final workflows, notifications, or downstream integrations.
+      operationId: saveFrontendDraft
+      parameters:
+        - name: formId
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Form definition ID
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - accountId
+                - siteId
+                - fields
+              properties:
+                accountId:
+                  type: string
+                  description: WP Suite account identifier
+                siteId:
+                  type: string
+                  description: WordPress site identifier
+                submissionId:
+                  type: string
+                  description: Existing draft submission ID when updating a draft
+                password:
+                  type: string
+                  description: Existing draft password when updating a draft
+                fields:
+                  type: object
+                  additionalProperties: true
+                  description: Current draft field values
+                payloadRef:
+                  type: object
+                  description: Reference to uploaded file payload (for large draft saves)
+                  properties:
+                    bucket:
+                      type: string
+                    key:
+                      type: string
+                    contentType:
+                      type: string
+                    size:
+                      type: integer
+                source:
+                  type: object
+                  description: Optional source metadata
+                  additionalProperties: true
+                context:
+                  type: object
+                  description: Additional context metadata
+                  additionalProperties: true
+      responses:
+        "200":
+          description: Draft saved
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  submissionId:
+                    type: string
+                  status:
+                    type: string
+                    example: draft
+                  password:
+                    type: string
+                    description: Present when a new draft is created
+                  updatedAt:
+                    type: string
+                    format: date-time
+                  expiresAt:
+                    type: string
+                    format: date-time
+                    nullable: true
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /frontend/forms/{formId}/drafts/load:
+    post:
+      tags:
+        - Frontend
+      summary: Load a saved draft
+      description: |
+        Load an existing draft submission by authenticating with the draft submission ID and password.
+      operationId: loadFrontendDraft
+      parameters:
+        - name: formId
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Form definition ID
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - accountId
+                - siteId
+                - submissionId
+                - password
+              properties:
+                accountId:
+                  type: string
+                siteId:
+                  type: string
+                submissionId:
+                  type: string
+                password:
+                  type: string
+      responses:
+        "200":
+          description: Draft loaded
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  submissionId:
+                    type: string
+                  status:
+                    type: string
+                    example: draft
+                  updatedAt:
+                    type: string
+                    format: date-time
+                  expiresAt:
+                    type: string
+                    format: date-time
+                    nullable: true
+                  formVersion:
+                    type: string
+                    nullable: true
+                  fields:
+                    type: object
+                    additionalProperties: true
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /frontend/forms/{formId}/drafts/delete:
+    post:
+      tags:
+        - Frontend
+      summary: Delete a saved draft
+      description: |
+        Delete an existing draft submission by authenticating with the draft submission ID and password.
+      operationId: deleteFrontendDraft
+      parameters:
+        - name: formId
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Form definition ID
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - accountId
+                - siteId
+                - submissionId
+                - password
+              properties:
+                accountId:
+                  type: string
+                siteId:
+                  type: string
+                submissionId:
+                  type: string
+                password:
+                  type: string
+      responses:
+        "200":
+          description: Draft deleted
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  submissionId:
+                    type: string
+                  deleted:
+                    type: boolean
+                  status:
+                    type: string
+                    example: deleted
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /frontend/forms/{formId}/drafts/{submissionId}/submit:
+    post:
+      tags:
+        - Frontend
+      summary: Finalize a saved draft
+      description: |
+        Convert an authenticated draft submission into a normal submitted record.
+        This runs the final validation and normal workflow/event processing.
+      operationId: submitFrontendDraft
+      parameters:
+        - name: formId
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Form definition ID
+        - name: submissionId
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Draft submission ID
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - accountId
+                - siteId
+                - password
+                - fields
+              properties:
+                accountId:
+                  type: string
+                  description: WP Suite account identifier
+                siteId:
+                  type: string
+                  description: WordPress site identifier
+                password:
+                  type: string
+                  description: Draft password used to authenticate the finalize operation
+                fields:
+                  type: object
+                  additionalProperties: true
+                  description: Final submitted form field data
+                recaptchaToken:
+                  type: string
+                  description: reCAPTCHA token (required if reCAPTCHA is enabled)
+                payloadRef:
+                  type: object
+                  description: Reference to uploaded file payload (for large submissions)
+                  properties:
+                    bucket:
+                      type: string
+                    key:
+                      type: string
+                    contentType:
+                      type: string
+                    size:
+                      type: integer
+                context:
+                  type: object
+                  description: Additional context metadata
+                  additionalProperties: true
+      responses:
+        "200":
+          description: Draft finalized and submitted
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  submissionId:
+                    type: string
+                  status:
+                    type: string
+                    example: submitted
+                  message:
+                    type: string
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /frontend/forms/{formId}/upload-url:
+    post:
+      tags:
+        - Frontend
+      summary: Generate presigned upload URL
+      description: |
+        Generate a presigned S3 URL for uploading large file payloads before form submission.
+        Use the returned upload details with the /submit endpoint's payloadRef parameter.
+      operationId: generateUploadUrl
+      parameters:
+        - name: formId
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - accountId
+                - siteId
+                - fileName
+              properties:
+                accountId:
+                  type: string
+                siteId:
+                  type: string
+                fileName:
+                  type: string
+                  description: Original file name
+                contentType:
+                  type: string
+                  default: application/octet-stream
+                expiresIn:
+                  type: integer
+                  minimum: 60
+                  maximum: 3600
+                  default: 900
+                  description: URL expiration time in seconds
+      responses:
+        "200":
+          description: Upload URL generated
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  uploadId:
+                    type: string
+                  bucket:
+                    type: string
+                  key:
+                    type: string
+                  method:
+                    type: string
+                    example: PUT
+                  url:
+                    type: string
+                    format: uri
+                  headers:
+                    type: object
+                    properties:
+                      Content-Type:
+                        type: string
+                  expiresIn:
+                    type: integer
+        "400":
+          $ref: "#/components/responses/BadRequest"
+
+  /admin/forms:
+    get:
+      tags:
+        - Admin - Forms
+      summary: List forms
+      description: Query all form definitions for a specific site
+      operationId: listForms
+      parameters:
+        - $ref: "#/components/parameters/AccountId"
+        - $ref: "#/components/parameters/SiteId"
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Cursor"
+      responses:
+        "200":
+          description: Forms list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/FormDefinition"
+                  cursor:
+                    type: string
+                    nullable: true
+        "400":
+          $ref: "#/components/responses/BadRequest"
+
+    post:
+      tags:
+        - Admin - Forms
+      summary: Create form
+      description: Create a new form definition
+      operationId: createForm
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/FormDefinition"
+      responses:
+        "201":
+          description: Form created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/FormDefinition"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+
+  /admin/forms/{formId}:
+    get:
+      tags:
+        - Admin - Forms
+      summary: Get form
+      operationId: getForm
+      parameters:
+        - name: formId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Form definition
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/FormDefinition"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+    put:
+      tags:
+        - Admin - Forms
+      summary: Update form
+      operationId: updateForm
+      parameters:
+        - name: formId
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/FormDefinition"
+      responses:
+        "200":
+          description: Form updated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/FormDefinition"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+    delete:
+      tags:
+        - Admin - Forms
+      summary: Delete form
+      operationId: deleteForm
+      parameters:
+        - name: formId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "204":
+          description: Form deleted
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /admin/forms/{formId}/submissions:
+    get:
+      tags:
+        - Admin - Submissions
+      summary: List form submissions
+      description: Query submissions for a specific form with filtering and sorting
+      operationId: listFormSubmissions
+      parameters:
+        - name: formId
+          in: path
+          required: true
+          schema:
+            type: string
+        - $ref: "#/components/parameters/AccountId"
+        - $ref: "#/components/parameters/SiteId"
+        - $ref: "#/components/parameters/Status"
+        - $ref: "#/components/parameters/Email"
+        - $ref: "#/components/parameters/Search"
+        - $ref: "#/components/parameters/From"
+        - $ref: "#/components/parameters/To"
+        - $ref: "#/components/parameters/SortBy"
+        - $ref: "#/components/parameters/SortDir"
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Cursor"
+      responses:
+        "200":
+          description: Submissions list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Submission"
+                  cursor:
+                    type: string
+                    nullable: true
+
+  /admin/forms/{formId}/submissions/{submissionId}:
+    get:
+      tags:
+        - Admin - Submissions
+      summary: Get submission
+      description: Retrieve a specific submission with optional event timeline
+      operationId: getSubmission
+      parameters:
+        - name: formId
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: submissionId
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: includeTimeline
+          in: query
+          schema:
+            type: boolean
+            default: false
+          description: Include submission event timeline
+      responses:
+        "200":
+          description: Submission details
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Submission"
+                  - type: object
+                    properties:
+                      timeline:
+                        type: array
+                        items:
+                          $ref: "#/components/schemas/SubmissionEvent"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+    patch:
+      tags:
+        - Admin - Submissions
+      summary: Update submission
+      description: Partially update submission data (status, fields, tags, email)
+      operationId: patchSubmission
+      parameters:
+        - name: formId
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: submissionId
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                status:
+                  type: string
+                  example: approved
+                fields:
+                  type: object
+                  additionalProperties: true
+                tags:
+                  type: array
+                  items:
+                    type: string
+                email:
+                  type: string
+                  format: email
+                notes:
+                  type: string
+      responses:
+        "200":
+          description: Submission updated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Submission"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+    delete:
+      tags:
+        - Admin - Submissions
+      summary: Delete submission
+      operationId: deleteSubmission
+      parameters:
+        - name: formId
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: submissionId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "204":
+          description: Submission deleted
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /admin/forms/{formId}/submissions/{submissionId}/actions/{actionKey}:
+    post:
+      tags:
+        - Admin - Submissions
+      summary: Invoke submission action
+      description: |
+        Execute a predefined action on a submission (approve, reject, send email, etc.).
+        Actions are configured in the form definition.
+      operationId: invokeSubmissionAction
+      parameters:
+        - name: formId
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: submissionId
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: actionKey
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Action identifier from form definition
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                variables:
+                  type: object
+                  additionalProperties: true
+                  description: Custom variables for template rendering
+      responses:
+        "200":
+          description: Action executed
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  message:
+                    type: string
+                  submission:
+                    $ref: "#/components/schemas/Submission"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /admin/forms/{formId}/submissions/{submissionId}/events:
+    get:
+      tags:
+        - Admin - Submissions
+      summary: List submission events
+      description: Get audit trail of events for a submission
+      operationId: listSubmissionEvents
+      parameters:
+        - name: formId
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: submissionId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Event timeline
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/SubmissionEvent"
+
+  /admin/submissions:
+    get:
+      tags:
+        - Admin - Submissions
+      summary: List site submissions
+      description: Query all submissions across all forms for a site
+      operationId: listSiteSubmissions
+      parameters:
+        - $ref: "#/components/parameters/AccountId"
+        - $ref: "#/components/parameters/SiteId"
+        - name: formId
+          in: query
+          schema:
+            type: string
+          description: Filter by specific form
+        - $ref: "#/components/parameters/Status"
+        - $ref: "#/components/parameters/Email"
+        - $ref: "#/components/parameters/Search"
+        - $ref: "#/components/parameters/From"
+        - $ref: "#/components/parameters/To"
+        - $ref: "#/components/parameters/SortBy"
+        - $ref: "#/components/parameters/SortDir"
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Cursor"
+      responses:
+        "200":
+          description: Submissions list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Submission"
+                  cursor:
+                    type: string
+                    nullable: true
+
+  /admin/templates:
+    get:
+      tags:
+        - Admin - Templates
+      summary: List templates
+      description: Query email templates
+      operationId: listTemplates
+      parameters:
+        - $ref: "#/components/parameters/AccountId"
+        - $ref: "#/components/parameters/SiteId"
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Cursor"
+      responses:
+        "200":
+          description: Templates list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/EmailTemplate"
+                  cursor:
+                    type: string
+                    nullable: true
+
+    post:
+      tags:
+        - Admin - Templates
+      summary: Create template
+      operationId: createTemplate
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/EmailTemplate"
+      responses:
+        "201":
+          description: Template created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EmailTemplate"
+
+  /admin/templates/{templateKey}:
+    get:
+      tags:
+        - Admin - Templates
+      summary: Get template
+      operationId: getTemplate
+      parameters:
+        - name: templateKey
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Template details
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EmailTemplate"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+    put:
+      tags:
+        - Admin - Templates
+      summary: Update template
+      operationId: updateTemplate
+      parameters:
+        - name: templateKey
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/EmailTemplate"
+      responses:
+        "200":
+          description: Template updated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EmailTemplate"
+
+    delete:
+      tags:
+        - Admin - Templates
+      summary: Delete template
+      operationId: deleteTemplate
+      parameters:
+        - name: templateKey
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "204":
+          description: Template deleted
+
+  /admin/templates/{templateKey}/preview:
+    post:
+      tags:
+        - Admin - Templates
+      summary: Preview template
+      description: Render template with sample variables for preview
+      operationId: previewTemplate
+      parameters:
+        - name: templateKey
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                variables:
+                  type: object
+                  additionalProperties: true
+      responses:
+        "200":
+          description: Rendered template
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  subject:
+                    type: string
+                  htmlBody:
+                    type: string
+                  textBody:
+                    type: string
+
+  /admin/workflows:
+    get:
+      tags:
+        - Admin - Workflows
+      summary: List workflows
+      operationId: listWorkflows
+      parameters:
+        - $ref: "#/components/parameters/AccountId"
+        - $ref: "#/components/parameters/SiteId"
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Cursor"
+      responses:
+        "200":
+          description: Workflows list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Workflow"
+                  cursor:
+                    type: string
+                    nullable: true
+
+    post:
+      tags:
+        - Admin - Workflows
+      summary: Create workflow
+      operationId: createWorkflow
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/Workflow"
+      responses:
+        "201":
+          description: Workflow created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Workflow"
+
+  /admin/workflows/{workflowId}:
+    get:
+      tags:
+        - Admin - Workflows
+      summary: Get workflow
+      operationId: getWorkflow
+      parameters:
+        - name: workflowId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Workflow details
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Workflow"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+    put:
+      tags:
+        - Admin - Workflows
+      summary: Update workflow
+      operationId: updateWorkflow
+      parameters:
+        - name: workflowId
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/Workflow"
+      responses:
+        "200":
+          description: Workflow updated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Workflow"
+
+    delete:
+      tags:
+        - Admin - Workflows
+      summary: Delete workflow
+      operationId: deleteWorkflow
+      parameters:
+        - name: workflowId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "204":
+          description: Workflow deleted
+
+  /admin/webhook-endpoints:
+    get:
+      tags:
+        - Admin - Webhooks
+      summary: List webhook endpoints
+      operationId: listWebhookEndpoints
+      parameters:
+        - $ref: "#/components/parameters/AccountId"
+        - $ref: "#/components/parameters/SiteId"
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Cursor"
+      responses:
+        "200":
+          description: Webhook endpoints list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/WebhookEndpoint"
+                  cursor:
+                    type: string
+                    nullable: true
+
+    post:
+      tags:
+        - Admin - Webhooks
+      summary: Create webhook endpoint
+      operationId: createWebhookEndpoint
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/WebhookEndpoint"
+      responses:
+        "201":
+          description: Webhook endpoint created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WebhookEndpoint"
+
+  /admin/webhook-endpoints/{webhookKey}:
+    get:
+      tags:
+        - Admin - Webhooks
+      summary: Get webhook endpoint
+      operationId: getWebhookEndpoint
+      parameters:
+        - name: webhookKey
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Webhook endpoint details
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WebhookEndpoint"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+    put:
+      tags:
+        - Admin - Webhooks
+      summary: Update webhook endpoint
+      operationId: updateWebhookEndpoint
+      parameters:
+        - name: webhookKey
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/WebhookEndpoint"
+      responses:
+        "200":
+          description: Webhook endpoint updated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WebhookEndpoint"
+
+    delete:
+      tags:
+        - Admin - Webhooks
+      summary: Delete webhook endpoint
+      operationId: deleteWebhookEndpoint
+      parameters:
+        - name: webhookKey
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "204":
+          description: Webhook endpoint deleted
+
+components:
+  parameters:
+    AccountId:
+      name: accountId
+      in: query
+      required: true
+      schema:
+        type: string
+      description: WP Suite account ID
+
+    SiteId:
+      name: siteId
+      in: query
+      required: true
+      schema:
+        type: string
+      description: WordPress site ID
+
+    Status:
+      name: status
+      in: query
+      schema:
+        type: string
+      description: Filter by submission status
+
+    Email:
+      name: email
+      in: query
+      schema:
+        type: string
+        format: email
+      description: Filter by email address
+
+    Search:
+      name: search
+      in: query
+      schema:
+        type: string
+      description: Full-text search across submission fields
+
+    From:
+      name: from
+      in: query
+      schema:
+        type: string
+        format: date-time
+      description: Filter submissions created after this timestamp
+
+    To:
+      name: to
+      in: query
+      schema:
+        type: string
+        format: date-time
+      description: Filter submissions created before this timestamp
+
+    SortBy:
+      name: sortBy
+      in: query
+      schema:
+        type: string
+        default: createdAt
+      description: Field to sort by
+
+    SortDir:
+      name: sortDir
+      in: query
+      schema:
+        type: string
+        enum: [asc, desc]
+        default: desc
+      description: Sort direction
+
+    Limit:
+      name: limit
+      in: query
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 100
+        default: 20
+      description: Maximum number of items to return
+
+    Cursor:
+      name: cursor
+      in: query
+      schema:
+        type: string
+      description: Pagination cursor from previous response
+
+  schemas:
+    FormDefinition:
+      type: object
+      required:
+        - formId
+        - accountId
+        - siteId
+        - name
+      properties:
+        formId:
+          type: string
+        accountId:
+          type: string
+        siteId:
+          type: string
+        name:
+          type: string
+        description:
+          type: string
+        enabled:
+          type: boolean
+          default: true
+        locale:
+          type: string
+          example: en_US
+        siteName:
+          type: string
+        autoReplyTemplateKey:
+          type: string
+          description: Template key for auto-reply emails
+        actions:
+          type: array
+          items:
+            type: object
+            properties:
+              actionKey:
+                type: string
+              label:
+                type: string
+              allowedFromStatuses:
+                type: array
+                items:
+                  type: string
+              targetStatus:
+                type: string
+              templateKey:
+                type: string
+              eventName:
+                type: string
+              wpHookName:
+                type: string
+              enabled:
+                type: boolean
+        fieldSchema:
+          type: object
+          additionalProperties: true
+        settings:
+          type: object
+          additionalProperties: true
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+
+    Submission:
+      type: object
+      properties:
+        submissionId:
+          type: string
+        accountId:
+          type: string
+        siteId:
+          type: string
+        formId:
+          type: string
+        status:
+          type: string
+          example: new
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+        fields:
+          type: object
+          additionalProperties: true
+        email:
+          type: string
+          format: email
+        emailSource:
+          type: string
+          enum: [field, manual, none]
+        tags:
+          type: array
+          items:
+            type: string
+        primaryLabel:
+          type: string
+        summary:
+          type: string
+        source:
+          type: object
+          properties:
+            ipHash:
+              type: string
+            uaHash:
+              type: string
+          additionalProperties: true
+        actor:
+          type: object
+          properties:
+            type:
+              type: string
+              enum: [anonymous, user, system]
+        payloadRef:
+          type: object
+          properties:
+            bucket:
+              type: string
+            key:
+              type: string
+            contentType:
+              type: string
+            size:
+              type: integer
+        notes:
+          type: string
+
+    SubmissionEvent:
+      type: object
+      properties:
+        eventId:
+          type: string
+        submissionId:
+          type: string
+        eventType:
+          type: string
+        occurredAt:
+          type: string
+          format: date-time
+        actor:
+          type: object
+        detail:
+          type: object
+          additionalProperties: true
+
+    EmailTemplate:
+      type: object
+      required:
+        - templateKey
+        - accountId
+        - siteId
+        - name
+      properties:
+        templateKey:
+          type: string
+        accountId:
+          type: string
+        siteId:
+          type: string
+        name:
+          type: string
+        description:
+          type: string
+        locale:
+          type: string
+        subject:
+          type: string
+        htmlBody:
+          type: string
+        textBody:
+          type: string
+        fromEmail:
+          type: string
+          format: email
+        fromName:
+          type: string
+        replyToEmail:
+          type: string
+          format: email
+        templateEngine:
+          type: string
+          enum: [handlebars, mustache, liquid]
+          default: handlebars
+        enabled:
+          type: boolean
+          default: true
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+
+    Workflow:
+      type: object
+      required:
+        - workflowId
+        - accountId
+        - siteId
+        - name
+      properties:
+        workflowId:
+          type: string
+        accountId:
+          type: string
+        siteId:
+          type: string
+        name:
+          type: string
+        description:
+          type: string
+        enabled:
+          type: boolean
+          default: true
+        trigger:
+          type: object
+          properties:
+            eventType:
+              type: string
+              example: submission.created
+            conditions:
+              type: array
+              items:
+                type: object
+        steps:
+          type: array
+          items:
+            type: object
+            properties:
+              stepId:
+                type: string
+              type:
+                type: string
+                enum: [email, webhook, status-change, delay, condition]
+              config:
+                type: object
+                additionalProperties: true
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+
+    WebhookEndpoint:
+      type: object
+      required:
+        - webhookKey
+        - accountId
+        - siteId
+        - url
+      properties:
+        webhookKey:
+          type: string
+        accountId:
+          type: string
+        siteId:
+          type: string
+        url:
+          type: string
+          format: uri
+        name:
+          type: string
+        description:
+          type: string
+        enabled:
+          type: boolean
+          default: true
+        events:
+          type: array
+          items:
+            type: string
+          description: EventBridge event types to forward
+        signingSecret:
+          type: string
+          description: HMAC signature secret
+        headers:
+          type: object
+          additionalProperties:
+            type: string
+        retryPolicy:
+          type: object
+          properties:
+            maxAttempts:
+              type: integer
+              default: 3
+            backoffMultiplier:
+              type: number
+              default: 2
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+
+    Error:
+      type: object
+      properties:
+        message:
+          type: string
+        errors:
+          type: array
+          items:
+            type: string
+
+  responses:
+    BadRequest:
+      description: Bad request
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+
+    NotFound:
+      description: Resource not found
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+
+    Forbidden:
+      description: Forbidden
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+
+    InternalError:
+      description: Internal server error
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+
+  securitySchemes:
+    CognitoAuthorizer:
+      type: apiKey
+      name: Authorization
+      in: header
+      description: Cognito JWT token
+      x-amazon-apigateway-authtype: cognito_user_pools
+
+    IamAuthorizer:
+      type: apiKey
+      name: Authorization
+      in: header
+      description: AWS Signature Version 4
+      x-amazon-apigateway-authtype: awsSigv4

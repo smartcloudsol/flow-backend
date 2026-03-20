@@ -1,0 +1,51 @@
+# Node / package manager
+node_modules/
+
+# Environment / local config
+.env
+.env.*
+!.env.example
+
+# Editor / OS
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Test / coverage
+coverage/
+.nyc_output/
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Caches / build metadata
+.cache/
+.eslintcache
+*.tsbuildinfo
+
+# Keep public deployment artifacts checked in
+!.artifacts/
+!.artifacts/**
+
+# Keep public custom resource source and shared helpers
+!src/
+!src/custom-resource/
+!src/custom-resource/**
+!src/shared/
+!src/shared/**
+
+# Exclude proprietary runtime sources
+src/core/
+src/forms-api/
+src/email-sender/
+src/workflow-dispatcher/
+src/webhook-dispatcher/
+src/webhook-trigger-dispatcher/
+
+# Optional local build output if ever created outside .artifacts
+build/
+dist/

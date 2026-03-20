@@ -1,0 +1,152 @@
+# ============================================================================
+# WP Suite AI Kit - Git Attributes
+# ============================================================================
+
+# Auto detect text files and perform LF normalization
+* text=auto
+
+# ============================================================================
+# Source Code
+# ============================================================================
+
+# TypeScript
+*.ts text eol=lf
+*.tsx text eol=lf
+
+# JavaScript
+*.js text eol=lf
+*.jsx text eol=lf
+*.mjs text eol=lf
+*.cjs text eol=lf
+
+# JSON
+*.json text eol=lf
+
+# ============================================================================
+# Configuration Files
+# ============================================================================
+
+# YAML
+*.yaml text eol=lf
+*.yml text eol=lf
+
+# Shell scripts
+*.sh text eol=lf
+*.bash text eol=lf
+
+# Make shell scripts executable
+*.sh linguist-language=Shell
+*.bash linguist-language=Shell
+
+# ============================================================================
+# Documentation
+# ============================================================================
+
+# Markdown
+*.md text eol=lf
+*.markdown text eol=lf
+
+# Text files
+*.txt text eol=lf
+LICENSE text eol=lf
+README text eol=lf
+
+# ============================================================================
+# Web Files
+# ============================================================================
+
+# HTML
+*.html text eol=lf
+*.htm text eol=lf
+
+# CSS
+*.css text eol=lf
+*.scss text eol=lf
+*.sass text eol=lf
+*.less text eol=lf
+
+# ============================================================================
+# Binary Files
+# ============================================================================
+
+# Images
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.svg binary
+*.webp binary
+
+# Fonts
+*.woff binary
+*.woff2 binary
+*.ttf binary
+*.otf binary
+*.eot binary
+
+# Archives
+*.zip binary
+*.tar binary
+*.gz binary
+*.tgz binary
+*.rar binary
+*.7z binary
+
+# Documents
+*.pdf binary
+*.doc binary
+*.docx binary
+*.xls binary
+*.xlsx binary
+*.ppt binary
+*.pptx binary
+
+# ============================================================================
+# Git LFS (Large File Storage) - Optional
+# ============================================================================
+
+# Uncomment if using Git LFS for large files
+# *.zip filter=lfs diff=lfs merge=lfs -text
+# *.tar.gz filter=lfs diff=lfs merge=lfs -text
+# *.pdf filter=lfs diff=lfs merge=lfs -text
+
+# ============================================================================
+# Language Statistics
+# ============================================================================
+
+# Exclude generated files from language statistics
+backend/src/*/dist/* linguist-generated=true
+backend/.artifacts/* linguist-generated=true
+backend/packaged/* linguist-generated=true
+*.min.js linguist-generated=true
+*.min.css linguist-generated=true
+
+# Mark documentation
+*.md linguist-documentation=true
+
+# Mark vendor code
+node_modules/* linguist-vendored=true
+vendor/* linguist-vendored=true
+
+# ============================================================================
+# Diff Settings
+# ============================================================================
+
+# Better diff for package.json
+package.json diff=json
+package-lock.json diff=json
+
+# Better diff for markdown
+*.md diff=markdown
+
+# ============================================================================
+# Merge Settings
+# ============================================================================
+
+# Don't merge package-lock.json automatically
+package-lock.json merge=binary
+
+# Don't merge generated files
+*.min.js merge=binary
+*.min.css merge=binary
