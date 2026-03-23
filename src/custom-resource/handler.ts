@@ -16,6 +16,20 @@ import {
   SSMClient,
 } from "@aws-sdk/client-ssm";
 import {
+  AbortMultipartUploadCommand,
+  DeleteObjectsCommand,
+  ListMultipartUploadsCommand,
+  ListObjectVersionsCommand,
+  S3Client,
+} from "@aws-sdk/client-s3";
+import {
+  CreateMalwareProtectionPlanCommand,
+  DeleteMalwareProtectionPlanCommand,
+  GetMalwareProtectionPlanCommand,
+  GuardDutyClient,
+  UpdateMalwareProtectionPlanCommand,
+} from "@aws-sdk/client-guardduty";
+import {
   AssociateWebACLCommand,
   CreateIPSetCommand,
   CreateWebACLCommand,
@@ -42,6 +56,8 @@ import {
 const waf = new WAFV2Client({});
 const ssm = new SSMClient({});
 const apiGateway = new APIGatewayClient({});
+const guardDuty = new GuardDutyClient({});
+const s3 = new S3Client({});
 
 type RouteSpec = {
   path: string;
@@ -168,6 +184,133 @@ async function handleSsmSecret(event: CloudFormationCustomResourceEvent) {
     }),
   );
   return { PhysicalResourceId: name, Data: { Name: name } };
+}
+
+async function handleBucketCleaner(event: CloudFormationCustomResourceEvent) {
+  const bucketName = String(event.ResourceProperties.BucketName || "").trim();
+
+  if (!bucketName) {
+    throw new Error("BucketName is required");
+  }
+
+  if (event.RequestType !== "Delete") {
+    return {
+      PhysicalResourceId: bucketName,
+      Data: {
+        BucketName: bucketName,
+        Status: event.RequestType === "Create" ? "Created" : "Updated",
+      },
+    };
+  }
+
+  let deletedObjects = 0;
+  let deletedVersions = 0;
+  let deletedMarkers = 0;
+  let abortedUploads = 0;
+
+  try {
+    let keyMarker: string | undefined;
+    let versionIdMarker: string | undefined;
+
+    do {
+      const listed = await s3.send(
+        new ListObjectVersionsCommand({
+          Bucket: bucketName,
+          KeyMarker: keyMarker,
+          VersionIdMarker: versionIdMarker,
+          MaxKeys: 1000,
+        }),
+      );
+
+      const objects = [
+        ...(listed.Versions || []).flatMap((version) =>
+          version.Key && version.VersionId
+            ? [
+                {
+                  Key: version.Key,
+                  VersionId: version.VersionId,
+                },
+              ]
+            : [],
+        ),
+        ...(listed.DeleteMarkers || []).flatMap((marker) =>
+          marker.Key && marker.VersionId
+            ? [
+                {
+                  Key: marker.Key,
+                  VersionId: marker.VersionId,
+                },
+              ]
+            : [],
+        ),
+      ];
+
+      deletedVersions += listed.Versions?.length || 0;
+      deletedMarkers += listed.DeleteMarkers?.length || 0;
+
+      if (objects.length > 0) {
+        await s3.send(
+          new DeleteObjectsCommand({
+            Bucket: bucketName,
+            Delete: {
+              Objects: objects,
+              Quiet: true,
+            },
+          }),
+        );
+        deletedObjects += objects.length;
+      }
+
+      keyMarker = listed.NextKeyMarker;
+      versionIdMarker = listed.NextVersionIdMarker;
+    } while (keyMarker || versionIdMarker);
+
+    let uploadKeyMarker: string | undefined;
+    let uploadIdMarker: string | undefined;
+
+    do {
+      const uploads = await s3.send(
+        new ListMultipartUploadsCommand({
+          Bucket: bucketName,
+          KeyMarker: uploadKeyMarker,
+          UploadIdMarker: uploadIdMarker,
+          MaxUploads: 1000,
+        }),
+      );
+
+      for (const upload of uploads.Uploads || []) {
+        if (!upload.Key || !upload.UploadId) {
+          continue;
+        }
+
+        await s3.send(
+          new AbortMultipartUploadCommand({
+            Bucket: bucketName,
+            Key: upload.Key,
+            UploadId: upload.UploadId,
+          }),
+        );
+        abortedUploads += 1;
+      }
+
+      uploadKeyMarker = uploads.NextKeyMarker;
+      uploadIdMarker = uploads.NextUploadIdMarker;
+    } while (uploadKeyMarker || uploadIdMarker);
+  } catch (error) {
+    logError("BucketCleaner delete failed", error as Error, { bucketName });
+  }
+
+  return {
+    PhysicalResourceId: bucketName,
+    Data: {
+      BucketName: bucketName,
+      Status: "Deleted",
+      ObjectsDeleted: deletedObjects,
+      VersionsDeleted: deletedVersions,
+      DeleteMarkersDeleted: deletedMarkers,
+      MultipartUploadsAborted: abortedUploads,
+    },
+  };
 }
 
 async function handleWafIpSet(event: CloudFormationCustomResourceEvent) {
@@ -351,6 +494,164 @@ async function handleWafAssociation(event: CloudFormationCustomResourceEvent) {
   return {
     PhysicalResourceId: physicalId,
     Data: { WebACLArn: webACLArn, ResourceArn: resourceArn },
+  };
+}
+
+type MalwarePlanProperties = {
+  Role: string;
+  ProtectedResource: {
+    S3Bucket: {
+      BucketName?: string;
+      ObjectPrefixes?: string[];
+    };
+  };
+  Actions?: {
+    Tagging?: {
+      Status?: "ENABLED" | "DISABLED";
+    };
+  };
+  Tags?: Array<{ Key: string; Value: string }>;
+};
+
+function getMalwarePlanProperties(
+  event: CloudFormationCustomResourceEvent,
+): MalwarePlanProperties {
+  const props = event.ResourceProperties as Record<string, unknown>;
+  return {
+    Role: String(props.Role || ""),
+    ProtectedResource: (props.ProtectedResource || {
+      S3Bucket: {},
+    }) as MalwarePlanProperties["ProtectedResource"],
+    Actions: props.Actions as MalwarePlanProperties["Actions"],
+    Tags: Array.isArray(props.Tags)
+      ? (props.Tags as Array<{ Key: string; Value: string }>).filter(
+          (tag) => tag?.Key && tag?.Value !== undefined,
+        )
+      : undefined,
+  };
+}
+
+function bucketNameFromPlanProps(
+  props: MalwarePlanProperties | undefined,
+): string | undefined {
+  return props?.ProtectedResource?.S3Bucket?.BucketName;
+}
+
+function tagsArrayToMap(tags?: Array<{ Key: string; Value: string }>) {
+  if (!tags?.length) return undefined;
+  return Object.fromEntries(tags.map((tag) => [tag.Key, tag.Value]));
+}
+
+async function safeDeleteMalwareProtectionPlan(planId?: string) {
+  if (!planId) return;
+  try {
+    await guardDuty.send(
+      new DeleteMalwareProtectionPlanCommand({
+        MalwareProtectionPlanId: planId,
+      }),
+    );
+  } catch (error) {
+    if (
+      error instanceof Error &&
+      /not\s*found|resource.*does not exist|404/i.test(error.message)
+    ) {
+      return;
+    }
+    throw error;
+  }
+}
+
+async function handleGuardDutyMalwareProtectionPlan(
+  event: CloudFormationCustomResourceEvent,
+) {
+  const props = getMalwarePlanProperties(event);
+  const oldProps = event.OldResourceProperties
+    ? getMalwarePlanProperties({
+        ...event,
+        ResourceProperties: event.OldResourceProperties,
+      })
+    : undefined;
+
+  if (event.RequestType === "Delete") {
+    await safeDeleteMalwareProtectionPlan(event.PhysicalResourceId);
+    return {
+      PhysicalResourceId: event.PhysicalResourceId,
+      Data: { Status: "Deleted" },
+    };
+  }
+
+  if (!props.Role || !bucketNameFromPlanProps(props)) {
+    throw new Error(
+      "Role and ProtectedResource.S3Bucket.BucketName are required",
+    );
+  }
+
+  const bucketChanged =
+    bucketNameFromPlanProps(props) !== bucketNameFromPlanProps(oldProps);
+
+  if (
+    event.RequestType === "Create" ||
+    !event.PhysicalResourceId ||
+    bucketChanged
+  ) {
+    if (bucketChanged && event.PhysicalResourceId) {
+      await safeDeleteMalwareProtectionPlan(event.PhysicalResourceId);
+    }
+
+    const createResponse = await guardDuty.send(
+      new CreateMalwareProtectionPlanCommand({
+        Role: props.Role,
+        ProtectedResource: props.ProtectedResource,
+        Actions: props.Actions,
+        Tags: tagsArrayToMap(props.Tags),
+      }),
+    );
+
+    const planId = createResponse.MalwareProtectionPlanId;
+    const current = planId
+      ? await guardDuty.send(
+          new GetMalwareProtectionPlanCommand({
+            MalwareProtectionPlanId: planId,
+          }),
+        )
+      : undefined;
+
+    return {
+      PhysicalResourceId: planId,
+      Data: {
+        MalwareProtectionPlanId: planId,
+        Arn: current?.Arn,
+        Status: current?.Status,
+      },
+    };
+  }
+
+  await guardDuty.send(
+    new UpdateMalwareProtectionPlanCommand({
+      MalwareProtectionPlanId: event.PhysicalResourceId,
+      Role: props.Role,
+      Actions: props.Actions,
+      ProtectedResource: {
+        S3Bucket: {
+          ObjectPrefixes: props.ProtectedResource.S3Bucket.ObjectPrefixes,
+        },
+      },
+    }),
+  );
+
+  const current = await guardDuty.send(
+    new GetMalwareProtectionPlanCommand({
+      MalwareProtectionPlanId: event.PhysicalResourceId,
+    }),
+  );
+
+  return {
+    PhysicalResourceId: event.PhysicalResourceId,
+    Data: {
+      MalwareProtectionPlanId: event.PhysicalResourceId,
+      Arn: current.Arn,
+      Status: current.Status,
+    },
   };
 }
 
@@ -739,6 +1040,9 @@ export const handler = async (
       case "Custom::SSMParameter":
         result = await handleSsmSecret(event);
         break;
+      case "Custom::BucketCleaner":
+        result = await handleBucketCleaner(event);
+        break;
       case "Custom::WafIPSet":
         result = await handleWafIpSet(event);
         break;
@@ -750,6 +1054,9 @@ export const handler = async (
         break;
       case "Custom::ApiRoutes":
         result = await handleApiRoutes(event);
+        break;
+      case "Custom::GuardDutyMalwareProtectionPlan":
+        result = await handleGuardDutyMalwareProtectionPlan(event);
         break;
       default:
         throw new Error(`Unsupported resource type: ${event.ResourceType}`);

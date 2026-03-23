@@ -25,7 +25,7 @@ In practice, this means you can keep content editing and form design inside Word
 - **Webhook delivery pipeline** – workflow or manual-action driven outbound webhooks with a dedicated dispatcher worker.
 - **WordPress-to-AWS form sync** – Flow can treat WordPress as the editing surface while AWS stores and executes canonical backend form definitions.
 - **Customer-owned deployment model** – submissions, templates, workflow definitions, payloads, and integration secrets stay inside the customer’s own AWS account.
-- **Optional hardening** – Cognito/IAM auth, AWS WAF, reCAPTCHA, SecureString secrets, optional KMS-backed encryption, and optional GuardDuty malware scanning for uploaded payloads.
+- **Optional hardening** – Cognito/IAM auth, AWS WAF, reCAPTCHA, SecureString secrets, and optional KMS-backed encryption.
 
 ### Shared authentication foundation with Gatey
 
@@ -323,7 +323,6 @@ Secrets such as the reCAPTCHA secret and default webhook signing secret are stor
 | `AdminAllowedIPs` | `""` | Optional admin allow list. |
 | `BlockedIPs` | `""` | Optional block list. |
 | `EnableKmsForSecrets` | `false` | Create a dedicated KMS key for secrets. |
-| `EnableGuardDutyMalwareProtection` | `false` | Attach an Amazon GuardDuty Malware Protection plan to the payload bucket. This stack does not enable GuardDuty itself; GuardDuty must already be enabled in the target account and region. |
 
 ### Storage and delivery
 
@@ -394,82 +393,6 @@ Typical next steps are:
 5. sync or create forms
 6. create email templates and workflows
 7. verify SES sender configuration before enabling live email sending
-
-### Manual step when using an existing payload bucket
-
-If you provide `PayloadBucketName` and use an already existing S3 bucket, the stack cannot modify that bucket's CORS configuration for you.
-
-For browser-based uploads from Flow forms to work with presigned S3 `PUT` URLs, you must manually allow cross-origin access on that bucket.
-
-Recommended minimum CORS rule for the payload bucket:
-
-```json
-[
-	{
-		"AllowedHeaders": ["*"],
-		"AllowedMethods": ["PUT", "GET", "HEAD"],
-		"AllowedOrigins": ["*"],
-		"ExposeHeaders": ["ETag"],
-		"MaxAgeSeconds": 3600
-	}
-]
-```
-
-Without this, the frontend can successfully request the upload URL from the API, but the browser-to-S3 upload itself will fail due to CORS.
-
-If you let the SAR stack create the payload bucket for you, this CORS configuration is applied automatically by the template.
-
-### Optional GuardDuty Malware Protection for uploads
-
-If you enable `EnableGuardDutyMalwareProtection`, the stack also creates:
-
-- an IAM role that GuardDuty can assume for payload-bucket inspection and scan-result tagging
-- an `AWS::GuardDuty::MalwareProtectionPlan` bound to the payload bucket
-- automatic scan-result tagging on uploaded objects
-
-Important prerequisites:
-
-- GuardDuty must already be enabled in the target AWS account and region.
-- The payload bucket must be in the same account and region as this stack.
-- If you bring your own `PayloadBucketName`, the stack can attach GuardDuty malware scanning, but it still cannot fix missing CORS rules for browser uploads.
-
-Recommended enablement sequence:
-
-1. Enable Amazon GuardDuty in the same AWS account and region where this stack will run.
-2. Confirm that the target payload bucket is also in that same account and region.
-3. Decide whether you want Flow to create the payload bucket or whether you will supply `PayloadBucketName`.
-4. Deploy or update the stack with `EnableGuardDutyMalwareProtection=true`.
-5. After deployment, verify in the GuardDuty console that the malware protection plan is active for the payload bucket.
-
-What enabling this does and does not do:
-
-- It does enable malware scanning for newly uploaded objects in the payload bucket.
-- It does add scan-result tags to objects, which you can later use in admin logic, workflows, or downstream automation.
-- It does not automatically reject, quarantine, or delete malicious uploads.
-- It does not block your frontend upload flow before the object reaches S3.
-- It does not by itself stop admins, workflows, or integrations from reading the file unless you add your own enforcement logic on top.
-
-Operational impact:
-
-- GuardDuty receives permission to inspect objects in the payload bucket and write object tags with scan results.
-- The stack creates an additional IAM role for that purpose.
-- The plan may update bucket-notification-related settings that GuardDuty needs for malware scanning on the protected bucket.
-- If your organization manages GuardDuty centrally, this feature should be reviewed with the customer's cloud/security owner before rollout.
-
-Cost impact:
-
-- GuardDuty Malware Protection for S3 is a billable GuardDuty feature.
-- Costs are separate from the normal Lambda, S3, DynamoDB, API Gateway, and EventBridge costs of this stack.
-- The exact amount depends on GuardDuty pricing in the target region and the volume/size of uploaded objects.
-
-Important product behavior note:
-
-At the moment, Flow uses GuardDuty here as an inspection and tagging layer only. That means the stack can help detect suspicious uploads, but additional application logic is still needed if you want behavior such as:
-
-- hiding suspicious files from admins
-- preventing download of flagged files
-- blocking email/webhook/workflow steps when a file is flagged
-- moving or deleting flagged uploads automatically
 
 ---
 

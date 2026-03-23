@@ -1,11 +1,11 @@
 {
-  "buildTime": "2026-03-20T10:10:40Z",
+  "buildTime": "2026-03-20T16:59:14Z",
   "buildMode": "minified",
-  "gitSha": "b8b4997",
-  "gitBranch": "main",
+  "gitSha": "670de1a",
+  "gitBranch": "master",
   "nodeVersion": "v24.13.1",
   "functions": [
-    {"name": "forms-api", "size": 11989},
+    {"name": "forms-api", "size": 12042},
     {"name": "workflow-dispatcher", "size": 4402},
     {"name": "email-sender", "size": 2466},
     {"name": "webhook-dispatcher", "size": 2375},

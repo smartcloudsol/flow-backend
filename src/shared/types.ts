@@ -37,9 +37,9 @@ export interface SubmissionRecord extends JsonObject {
     type: "anonymous" | "authenticated" | "admin";
     sub?: string;
     email?: string;
-  draftPasswordHash?: string;
-  draftLastAccessedAt?: string;
-  draftSaveCount?: number;
+    draftPasswordHash?: string;
+    draftLastAccessedAt?: string;
+    draftSaveCount?: number;
   };
   source?: {
     pageUrl?: string;
@@ -48,6 +48,7 @@ export interface SubmissionRecord extends JsonObject {
     ipHash?: string;
     uaHash?: string;
   };
+  metadata?: Record<string, JsonValue>;
   tags?: string[];
   deletedAt?: string;
   internalNotes?: string;
@@ -89,10 +90,17 @@ export interface WorkflowDefinition extends JsonObject {
   enabled: boolean;
   name: string;
   trigger: {
-    type: string;
+    type?: string;
+    eventType?: string;
     formId?: string;
     actionKey?: string;
     status?: string;
+    conditions?: Array<{
+      field?: string;
+      operator?: string;
+      value?: unknown;
+    }>;
+    repeatPolicy?: "always" | "first-match-only";
   };
   filters?: Array<{
     field: string;
