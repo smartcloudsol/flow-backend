@@ -193,6 +193,7 @@ build_function() {
         "--external:@aws-sdk/lib-dynamodb"
         "--external:@aws-sdk/client-eventbridge"
         "--external:@aws-sdk/client-guardduty"
+        "--external:@aws-sdk/client-route-53"
         "--external:@aws-sdk/client-s3"
         "--external:@aws-sdk/s3-request-presigner"
         "--external:@aws-sdk/client-ssm"

@@ -1,15 +1,28 @@
 import {
   APIGatewayClient,
+  AuthorizerType,
+  CreateBasePathMappingCommand,
+  CreateAuthorizerCommand,
   CreateDeploymentCommand,
   CreateResourceCommand,
+  DeleteBasePathMappingCommand,
+  DeleteAuthorizerCommand,
+  GetAuthorizerCommand,
+  GetAuthorizersCommand,
+  GetBasePathMappingCommand,
   GetMethodCommand,
   GetResourcesCommand,
   PutIntegrationCommand,
   PutIntegrationResponseCommand,
   PutMethodCommand,
   PutMethodResponseCommand,
+  UpdateBasePathMappingCommand,
   UpdateMethodCommand,
 } from "@aws-sdk/client-api-gateway";
+import {
+  ListHostedZonesByNameCommand,
+  Route53Client,
+} from "@aws-sdk/client-route-53";
 import {
   DeleteParameterCommand,
   PutParameterCommand,
@@ -58,6 +71,38 @@ const ssm = new SSMClient({});
 const apiGateway = new APIGatewayClient({});
 const guardDuty = new GuardDutyClient({});
 const s3 = new S3Client({});
+const route53 = new Route53Client({});
+
+const API_MAX_RETRIES = 6;
+const API_BASE_DELAY_MS = 1000;
+const WAF_MAX_RETRIES = 7;
+const WAF_BASE_DELAY_MS = 2000;
+const RESPONSE_MAX_RETRIES = 5;
+const RESPONSE_BASE_DELAY_MS = 1000;
+
+const RETRYABLE_API_ERROR_NAMES = new Set([
+  "TooManyRequestsException",
+  "ThrottlingException",
+  "ThrottledException",
+  "LimitExceededException",
+  "ServiceUnavailableException",
+  "GatewayTimeoutException",
+  "InternalFailureException",
+  "InternalServerErrorException",
+]);
+
+const RETRYABLE_WAF_ERROR_NAMES = new Set([
+  "WAFUnavailableEntityException",
+  "WAFNonexistentItemException",
+  "WAFInternalErrorException",
+  "ThrottlingException",
+  "TooManyRequestsException",
+  "ServiceUnavailableException",
+]);
+
+const RETRYABLE_STATUS_CODES = new Set([
+  408, 409, 425, 429, 500, 502, 503, 504,
+]);
 
 type RouteSpec = {
   path: string;
@@ -66,6 +111,15 @@ type RouteSpec = {
   authorizerId?: string;
   authorizationScopes?: string[];
   integrationUri: string;
+};
+
+type ApiAuthorizerSummary = {
+  id?: string;
+  name?: string;
+  type?: string;
+  identitySource?: string;
+  providerARNs?: string[];
+  authorizerResultTtlInSeconds?: number;
 };
 
 async function sendResponse(
@@ -88,15 +142,445 @@ async function sendResponse(
     LogicalResourceId: event.LogicalResourceId,
     Data: data,
   });
-  await fetch(event.ResponseURL, {
-    method: "PUT",
-    headers: {
-      "Content-Type": "application/json",
-      "Content-Length": String(body.length),
-    },
-    body,
+
+  logInfo("Sending CloudFormation custom resource response", {
+    status,
+    logicalResourceId: event.LogicalResourceId,
+    physicalResourceId:
+      physicalResourceId || event.PhysicalResourceId || event.LogicalResourceId,
   });
+
+  await retryWithBackoff(
+    async () => {
+      const response = await fetch(event.ResponseURL, {
+        method: "PUT",
+        headers: {
+          "Content-Type": "application/json",
+          "Content-Length": String(body.length),
+        },
+        body,
+      });
+
+      if (!response.ok) {
+        const error = new Error(
+          `CloudFormation response failed with HTTP ${response.status} ${response.statusText}`,
+        ) as Error & { statusCode?: number };
+        error.statusCode = response.status;
+        throw error;
+      }
+    },
+    RESPONSE_MAX_RETRIES,
+    RESPONSE_BASE_DELAY_MS,
+    shouldRetryCloudFormationResponseError,
+  );
 }
+
+async function retryWithBackoff<T>(
+  operation: () => Promise<T>,
+  maxRetries = 3,
+  baseDelayMs = 1000,
+  shouldRetry?: (error: Error) => boolean,
+): Promise<T> {
+  let lastError: Error | undefined;
+
+  for (let attempt = 0; attempt <= maxRetries; attempt += 1) {
+    try {
+      return await operation();
+    } catch (error) {
+      lastError = error as Error;
+      const canRetry =
+        attempt < maxRetries && (shouldRetry ? shouldRetry(lastError) : true);
+
+      if (!canRetry) {
+        break;
+      }
+
+      const delayMs = baseDelayMs * 2 ** attempt;
+      logInfo("Retrying custom resource operation", {
+        attempt: attempt + 1,
+        maxRetries,
+        delayMs,
+        errorName: lastError.name,
+        errorMessage: lastError.message,
+      });
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
+  }
+
+  if (lastError) {
+    throw lastError;
+  }
+
+  throw new Error(`Operation failed after ${maxRetries + 1} attempts`);
+}
+
+function getStatusCode(error: Error): number | undefined {
+  return (
+    (error as Error & { statusCode?: number }).statusCode ||
+    (error as Error & { $metadata?: { httpStatusCode?: number } }).$metadata
+      ?.httpStatusCode
+  );
+}
+
+function shouldRetryApiGatewayError(error: Error): boolean {
+  return (
+    RETRYABLE_API_ERROR_NAMES.has(error.name) ||
+    (typeof getStatusCode(error) === "number" &&
+      RETRYABLE_STATUS_CODES.has(getStatusCode(error)!))
+  );
+}
+
+function shouldRetryAuthorizerDeleteError(error: Error): boolean {
+  if (isAuthorizerDeleteConflict(error) || isMissingAuthorizerOrApi(error)) {
+    return false;
+  }
+  return shouldRetryApiGatewayError(error);
+}
+
+function isMissingAuthorizerOrApi(error: Error): boolean {
+  const message = error.message.toLowerCase();
+  return (
+    error.name === "NotFoundException" ||
+    error.name === "ResourceNotFoundException" ||
+    (error.name === "BadRequestException" &&
+      (message.includes("invalid authorizer") ||
+        message.includes("invalid authorizer identifier") ||
+        message.includes("invalid rest api") ||
+        message.includes("invalid api identifier") ||
+        message.includes("not found")))
+  );
+}
+
+function isAuthorizerDeleteConflict(error: Error): boolean {
+  return (
+    error.name === "ConflictException" ||
+    /cannot delete authorizer|referenced in method/i.test(error.message)
+  );
+}
+
+function shouldRetryWafError(error: Error): boolean {
+  return (
+    RETRYABLE_WAF_ERROR_NAMES.has(error.name) ||
+    (typeof getStatusCode(error) === "number" &&
+      RETRYABLE_STATUS_CODES.has(getStatusCode(error)!))
+  );
+}
+
+function shouldRetryCloudFormationResponseError(error: Error): boolean {
+  return (
+    error.name === "TypeError" ||
+    /fetch failed|network|socket|timed out/i.test(error.message) ||
+    (typeof getStatusCode(error) === "number" &&
+      RETRYABLE_STATUS_CODES.has(getStatusCode(error)!))
+  );
+}
+
+const sendApiGatewayWithRetry = <T>(operation: () => Promise<T>): Promise<T> =>
+  retryWithBackoff(
+    operation,
+    API_MAX_RETRIES,
+    API_BASE_DELAY_MS,
+    shouldRetryApiGatewayError,
+  );
+
+function normalizeProviderArns(value: unknown): string[] {
+  if (!value) return [];
+  if (Array.isArray(value)) {
+    return value
+      .map(String)
+      .map((item) => item.trim())
+      .filter(Boolean);
+  }
+  if (typeof value === "string") {
+    return value
+      .split(",")
+      .map((item) => item.trim())
+      .filter(Boolean);
+  }
+  return [];
+}
+
+function normalizeOptionalNumber(value: unknown): number | undefined {
+  if (value === undefined || value === null || value === "") {
+    return undefined;
+  }
+  const numberValue = typeof value === "number" ? value : Number(value);
+  if (!Number.isFinite(numberValue)) {
+    throw new Error(`Invalid numeric value: ${JSON.stringify(value)}`);
+  }
+  return numberValue;
+}
+
+function sameArrays(a: string[], b: string[]): boolean {
+  return JSON.stringify([...a].sort()) === JSON.stringify([...b].sort());
+}
+
+function sameString(a?: string, b?: string): boolean {
+  return (a || "") === (b || "");
+}
+
+function hasSameAuthorizerConfiguration(
+  current: ApiAuthorizerSummary,
+  desired: {
+    name: string;
+    type: string;
+    identitySource: string;
+    providerARNs: string[];
+    authorizerResultTtlInSeconds?: number;
+  },
+): boolean {
+  return (
+    sameString(current.name, desired.name) &&
+    sameString(current.type, desired.type) &&
+    sameString(current.identitySource, desired.identitySource) &&
+    sameArrays(current.providerARNs || [], desired.providerARNs) &&
+    current.authorizerResultTtlInSeconds ===
+      desired.authorizerResultTtlInSeconds
+  );
+}
+
+async function getAuthorizerById(
+  restApiId: string,
+  authorizerId: string,
+): Promise<ApiAuthorizerSummary | undefined> {
+  try {
+    const response = await sendApiGatewayWithRetry(() =>
+      apiGateway.send(new GetAuthorizerCommand({ restApiId, authorizerId })),
+    );
+    return {
+      id: response.id,
+      name: response.name,
+      type: response.type,
+      identitySource: response.identitySource,
+      providerARNs: response.providerARNs,
+      authorizerResultTtlInSeconds: response.authorizerResultTtlInSeconds,
+    };
+  } catch (error) {
+    if (isMissingAuthorizerOrApi(error as Error)) {
+      return undefined;
+    }
+    throw error;
+  }
+}
+
+async function findAuthorizerByName(
+  restApiId: string,
+  name: string,
+): Promise<ApiAuthorizerSummary | undefined> {
+  let position: string | undefined;
+
+  do {
+    const response = await sendApiGatewayWithRetry(() =>
+      apiGateway.send(
+        new GetAuthorizersCommand({
+          restApiId,
+          position,
+          limit: 500,
+        }),
+      ),
+    );
+
+    const match = response.items?.find((item) => item.name === name);
+    if (match) {
+      return {
+        id: match.id,
+        name: match.name,
+        type: match.type,
+        identitySource: match.identitySource,
+        providerARNs: match.providerARNs,
+        authorizerResultTtlInSeconds: match.authorizerResultTtlInSeconds,
+      };
+    }
+
+    position = response.position;
+  } while (position);
+
+  return undefined;
+}
+
+async function safeDeleteAuthorizer(
+  restApiId: string,
+  authorizerId?: string,
+): Promise<void> {
+  if (!restApiId || !authorizerId) {
+    return;
+  }
+
+  try {
+    await retryWithBackoff(
+      () =>
+        apiGateway.send(
+          new DeleteAuthorizerCommand({
+            restApiId,
+            authorizerId,
+          }),
+        ),
+      API_MAX_RETRIES,
+      API_BASE_DELAY_MS,
+      shouldRetryAuthorizerDeleteError,
+    );
+    logInfo("Deleted API Gateway authorizer", { restApiId, authorizerId });
+  } catch (error) {
+    if (isMissingAuthorizerOrApi(error as Error)) {
+      logInfo("API Gateway authorizer already absent during delete", {
+        restApiId,
+        authorizerId,
+      });
+      return;
+    }
+
+    if (isAuthorizerDeleteConflict(error as Error)) {
+      logInfo(
+        "API Gateway authorizer is still referenced during delete; allowing stack cleanup to continue",
+        {
+          restApiId,
+          authorizerId,
+        },
+      );
+      return;
+    }
+
+    throw error;
+  }
+}
+
+async function createAuthorizer(props: {
+  restApiId: string;
+  name: string;
+  type: AuthorizerType;
+  identitySource: string;
+  providerARNs: string[];
+  authorizerResultTtlInSeconds?: number;
+}): Promise<string> {
+  const response = await sendApiGatewayWithRetry(() =>
+    apiGateway.send(
+      new CreateAuthorizerCommand({
+        restApiId: props.restApiId,
+        name: props.name,
+        type: props.type,
+        identitySource: props.identitySource,
+        providerARNs: props.providerARNs,
+        authorizerResultTtlInSeconds: props.authorizerResultTtlInSeconds,
+      }),
+    ),
+  );
+
+  if (!response.id) {
+    throw new Error("CreateAuthorizer returned no id");
+  }
+
+  logInfo("Created API Gateway authorizer", {
+    restApiId: props.restApiId,
+    name: props.name,
+    authorizerId: response.id,
+  });
+
+  return response.id;
+}
+
+async function handleApiAuthorizer(event: CloudFormationCustomResourceEvent) {
+  if (event.RequestType === "Delete") {
+    const restApiId = String(
+      event.ResourceProperties.RestApiId ||
+        event.OldResourceProperties?.RestApiId ||
+        "",
+    );
+    await safeDeleteAuthorizer(restApiId, event.PhysicalResourceId);
+
+    return {
+      PhysicalResourceId:
+        event.PhysicalResourceId || `${restApiId}|${event.LogicalResourceId}`,
+      Data: { Status: "Deleted" },
+    };
+  }
+
+  const restApiId = String(event.ResourceProperties.RestApiId || "").trim();
+  const name = String(event.ResourceProperties.Name || "").trim();
+  const type = String(
+    event.ResourceProperties.Type || "COGNITO_USER_POOLS",
+  ).trim() as AuthorizerType;
+  const identitySource = String(
+    event.ResourceProperties.IdentitySource || "",
+  ).trim();
+  const providerARNs = normalizeProviderArns(
+    event.ResourceProperties.ProviderARNs,
+  );
+  const authorizerResultTtlInSeconds = normalizeOptionalNumber(
+    event.ResourceProperties.AuthorizerResultTtlInSeconds,
+  );
+
+  if (!restApiId || !name || !identitySource || providerARNs.length === 0) {
+    throw new Error(
+      "Custom::ApiAuthorizer requires RestApiId, Name, IdentitySource and ProviderARNs",
+    );
+  }
+
+  const oldRestApiId =
+    typeof event.OldResourceProperties?.RestApiId === "string"
+      ? String(event.OldResourceProperties.RestApiId)
+      : undefined;
+
+  if (
+    event.RequestType === "Update" &&
+    oldRestApiId &&
+    oldRestApiId !== restApiId &&
+    event.PhysicalResourceId
+  ) {
+    await safeDeleteAuthorizer(oldRestApiId, event.PhysicalResourceId);
+  }
+
+  let current: ApiAuthorizerSummary | undefined;
+  if (
+    event.PhysicalResourceId &&
+    (!oldRestApiId || oldRestApiId === restApiId)
+  ) {
+    current = await getAuthorizerById(restApiId, event.PhysicalResourceId);
+  }
+  if (!current) {
+    current = await findAuthorizerByName(restApiId, name);
+  }
+
+  const desired = {
+    name,
+    type,
+    identitySource,
+    providerARNs,
+    authorizerResultTtlInSeconds,
+  };
+
+  if (current?.id && hasSameAuthorizerConfiguration(current, desired)) {
+    return {
+      PhysicalResourceId: current.id,
+      Data: { AuthorizerId: current.id, Name: name },
+    };
+  }
+
+  if (current?.id) {
+    await safeDeleteAuthorizer(restApiId, current.id);
+  }
+
+  const authorizerId = await createAuthorizer({
+    restApiId,
+    name,
+    type,
+    identitySource,
+    providerARNs,
+    authorizerResultTtlInSeconds,
+  });
+
+  return {
+    PhysicalResourceId: authorizerId,
+    Data: { AuthorizerId: authorizerId, Name: name },
+  };
+}
+
+const sendWafWithRetry = <T>(operation: () => Promise<T>): Promise<T> =>
+  retryWithBackoff(
+    operation,
+    WAF_MAX_RETRIES,
+    WAF_BASE_DELAY_MS,
+    shouldRetryWafError,
+  );
 
 const toList = (value: unknown): string[] =>
   Array.isArray(value)
@@ -326,13 +810,15 @@ async function handleWafIpSet(event: CloudFormationCustomResourceEvent) {
     if (!event.PhysicalResourceId) return { Data: { Status: "Deleted" } };
     const [id, lockToken] = event.PhysicalResourceId.split("|");
     try {
-      await waf.send(
-        new DeleteIPSetCommand({
-          Id: id,
-          Name: name,
-          Scope: scope,
-          LockToken: lockToken,
-        }),
+      await sendWafWithRetry(() =>
+        waf.send(
+          new DeleteIPSetCommand({
+            Id: id,
+            Name: name,
+            Scope: scope,
+            LockToken: lockToken,
+          }),
+        ),
       );
     } catch {
       /** */
@@ -344,14 +830,16 @@ async function handleWafIpSet(event: CloudFormationCustomResourceEvent) {
   }
 
   if (event.RequestType === "Create" || !event.PhysicalResourceId) {
-    const resp = await waf.send(
-      new CreateIPSetCommand({
-        Name: name,
-        Scope: scope,
-        IPAddressVersion: ipAddressVersion,
-        Addresses: addresses,
-        Description: description,
-      }),
+    const resp = await sendWafWithRetry(() =>
+      waf.send(
+        new CreateIPSetCommand({
+          Name: name,
+          Scope: scope,
+          IPAddressVersion: ipAddressVersion,
+          Addresses: addresses,
+          Description: description,
+        }),
+      ),
     );
     return {
       PhysicalResourceId: `${resp.Summary?.Id}|${resp.Summary?.LockToken}`,
@@ -360,21 +848,23 @@ async function handleWafIpSet(event: CloudFormationCustomResourceEvent) {
   }
 
   const [id] = event.PhysicalResourceId.split("|");
-  const current = await waf.send(
-    new GetIPSetCommand({ Id: id, Name: name, Scope: scope }),
+  const current = await sendWafWithRetry(() =>
+    waf.send(new GetIPSetCommand({ Id: id, Name: name, Scope: scope })),
   );
-  await waf.send(
-    new UpdateIPSetCommand({
-      Id: id,
-      Name: name,
-      Scope: scope,
-      Addresses: addresses,
-      Description: description,
-      LockToken: current.LockToken!,
-    }),
+  await sendWafWithRetry(() =>
+    waf.send(
+      new UpdateIPSetCommand({
+        Id: id,
+        Name: name,
+        Scope: scope,
+        Addresses: addresses,
+        Description: description,
+        LockToken: current.LockToken!,
+      }),
+    ),
   );
-  const refreshed = await waf.send(
-    new GetIPSetCommand({ Id: id, Name: name, Scope: scope }),
+  const refreshed = await sendWafWithRetry(() =>
+    waf.send(new GetIPSetCommand({ Id: id, Name: name, Scope: scope })),
   );
   return {
     PhysicalResourceId: `${id}|${refreshed.LockToken}`,
@@ -412,13 +902,15 @@ async function handleWafWebAcl(event: CloudFormationCustomResourceEvent) {
     if (!event.PhysicalResourceId) return { Data: { Status: "Deleted" } };
     const [id, lockToken] = event.PhysicalResourceId.split("|");
     try {
-      await waf.send(
-        new DeleteWebACLCommand({
-          Id: id,
-          Name: name,
-          Scope: scope,
-          LockToken: lockToken,
-        }),
+      await sendWafWithRetry(() =>
+        waf.send(
+          new DeleteWebACLCommand({
+            Id: id,
+            Name: name,
+            Scope: scope,
+            LockToken: lockToken,
+          }),
+        ),
       );
     } catch {
       /** */
@@ -430,15 +922,17 @@ async function handleWafWebAcl(event: CloudFormationCustomResourceEvent) {
   }
 
   if (event.RequestType === "Create" || !event.PhysicalResourceId) {
-    const resp = await waf.send(
-      new CreateWebACLCommand({
-        Name: name,
-        Scope: scope,
-        Description: description,
-        DefaultAction: defaultAction,
-        Rules: rules,
-        VisibilityConfig: visibilityConfig,
-      }),
+    const resp = await sendWafWithRetry(() =>
+      waf.send(
+        new CreateWebACLCommand({
+          Name: name,
+          Scope: scope,
+          Description: description,
+          DefaultAction: defaultAction,
+          Rules: rules,
+          VisibilityConfig: visibilityConfig,
+        }),
+      ),
     );
     return {
       PhysicalResourceId: `${resp.Summary?.Id}|${resp.Summary?.LockToken}`,
@@ -447,23 +941,25 @@ async function handleWafWebAcl(event: CloudFormationCustomResourceEvent) {
   }
 
   const [id] = event.PhysicalResourceId.split("|");
-  const current = await waf.send(
-    new GetWebACLCommand({ Id: id, Name: name, Scope: scope }),
+  const current = await sendWafWithRetry(() =>
+    waf.send(new GetWebACLCommand({ Id: id, Name: name, Scope: scope })),
   );
-  await waf.send(
-    new UpdateWebACLCommand({
-      Id: id,
-      Name: name,
-      Scope: scope,
-      Description: description,
-      DefaultAction: defaultAction,
-      Rules: rules,
-      VisibilityConfig: visibilityConfig,
-      LockToken: current.LockToken!,
-    }),
+  await sendWafWithRetry(() =>
+    waf.send(
+      new UpdateWebACLCommand({
+        Id: id,
+        Name: name,
+        Scope: scope,
+        Description: description,
+        DefaultAction: defaultAction,
+        Rules: rules,
+        VisibilityConfig: visibilityConfig,
+        LockToken: current.LockToken!,
+      }),
+    ),
   );
-  const refreshed = await waf.send(
-    new GetWebACLCommand({ Id: id, Name: name, Scope: scope }),
+  const refreshed = await sendWafWithRetry(() =>
+    waf.send(new GetWebACLCommand({ Id: id, Name: name, Scope: scope })),
   );
   return {
     PhysicalResourceId: `${id}|${refreshed.LockToken}`,
@@ -475,22 +971,39 @@ async function handleWafAssociation(event: CloudFormationCustomResourceEvent) {
   const webACLArn = String(event.ResourceProperties.WebACLArn);
   const resourceArn = String(event.ResourceProperties.ResourceArn);
   const physicalId = `${webACLArn}|${resourceArn}`;
+
   if (event.RequestType === "Delete") {
     try {
-      await waf.send(
-        new DisassociateWebACLCommand({ ResourceArn: resourceArn }),
+      await sendWafWithRetry(() =>
+        waf.send(new DisassociateWebACLCommand({ ResourceArn: resourceArn })),
       );
-    } catch {
+    } catch (error) {
+      if ((error as Error).name !== "WAFNonexistentItemException") {
+        logError("WAF disassociation failed during delete", error as Error, {
+          resourceArn,
+        });
+      }
       /** */
     }
     return { PhysicalResourceId: physicalId, Data: { Status: "Deleted" } };
   }
-  await waf.send(
-    new AssociateWebACLCommand({
-      WebACLArn: webACLArn,
-      ResourceArn: resourceArn,
-    }),
+
+  await retryWithBackoff(
+    async () => {
+      await sendWafWithRetry(() =>
+        waf.send(
+          new AssociateWebACLCommand({
+            WebACLArn: webACLArn,
+            ResourceArn: resourceArn,
+          }),
+        ),
+      );
+    },
+    WAF_MAX_RETRIES,
+    WAF_BASE_DELAY_MS,
+    shouldRetryWafError,
   );
+
   return {
     PhysicalResourceId: physicalId,
     Data: { WebACLArn: webACLArn, ResourceArn: resourceArn },
@@ -553,8 +1066,18 @@ async function safeDeleteMalwareProtectionPlan(planId?: string) {
   } catch (error) {
     if (
       error instanceof Error &&
-      /not\s*found|resource.*does not exist|404/i.test(error.message)
+      (/not\s*found|resource.*does not exist|404|invalid or out-of-range/i.test(
+        error.message,
+      ) ||
+        error.name === "BadRequestException" ||
+        error.name === "ResourceNotFoundException" ||
+        error.name === "AccessDeniedException")
     ) {
+      logInfo("Ignoring GuardDuty malware protection plan delete error", {
+        planId,
+        errorName: error.name,
+        errorMessage: error.message,
+      });
       return;
     }
     throw error;
@@ -598,14 +1121,43 @@ async function handleGuardDutyMalwareProtectionPlan(
       await safeDeleteMalwareProtectionPlan(event.PhysicalResourceId);
     }
 
-    const createResponse = await guardDuty.send(
-      new CreateMalwareProtectionPlanCommand({
-        Role: props.Role,
-        ProtectedResource: props.ProtectedResource,
-        Actions: props.Actions,
-        Tags: tagsArrayToMap(props.Tags),
-      }),
-    );
+    const createInput = {
+      Role: props.Role,
+      ProtectedResource: props.ProtectedResource,
+      Actions: props.Actions,
+      Tags: tagsArrayToMap(props.Tags),
+    };
+
+    let createResponse;
+    try {
+      createResponse = await guardDuty.send(
+        new CreateMalwareProtectionPlanCommand(createInput),
+      );
+    } catch (error) {
+      if (
+        error instanceof Error &&
+        createInput.Tags &&
+        error.name === "AccessDeniedException" &&
+        /guardduty:TagResource/i.test(error.message)
+      ) {
+        logInfo(
+          "GuardDuty malware protection plan creation failed due to missing TagResource permission; retrying without tags",
+          {
+            errorMessage: error.message,
+          },
+        );
+
+        createResponse = await guardDuty.send(
+          new CreateMalwareProtectionPlanCommand({
+            Role: props.Role,
+            ProtectedResource: props.ProtectedResource,
+            Actions: props.Actions,
+          }),
+        );
+      } else {
+        throw error;
+      }
+    }
 
     const planId = createResponse.MalwareProtectionPlanId;
     const current = planId
@@ -655,19 +1207,259 @@ async function handleGuardDutyMalwareProtectionPlan(
   };
 }
 
+function generateCandidateDomains(domainName: string): string[] {
+  const labels = domainName
+    .trim()
+    .replace(/\.$/, "")
+    .split(".")
+    .filter(Boolean);
+
+  const domains: string[] = [];
+  for (let index = 0; index < labels.length - 1; index += 1) {
+    domains.push(labels.slice(index).join("."));
+  }
+  return domains;
+}
+
+async function handleHostedZoneLookup(
+  event: CloudFormationCustomResourceEvent,
+) {
+  if (event.RequestType === "Delete") {
+    return {
+      PhysicalResourceId:
+        event.PhysicalResourceId || `${event.LogicalResourceId}-deleted`,
+      Data: { HostedZoneId: "deleted", HostedZoneName: "deleted" },
+    };
+  }
+
+  const domainName = String(event.ResourceProperties.DomainName || "").trim();
+  if (!domainName) {
+    throw new Error("Custom::HostedZoneLookup requires DomainName");
+  }
+
+  for (const candidateDomain of generateCandidateDomains(domainName)) {
+    const response = (await retryWithBackoff(
+      () =>
+        route53.send(
+          new ListHostedZonesByNameCommand({
+            DNSName: candidateDomain.endsWith(".")
+              ? candidateDomain
+              : `${candidateDomain}.`,
+            MaxItems: 1,
+          }),
+        ),
+      3,
+      1000,
+    )) as {
+      HostedZones?: Array<{ Name?: string; Id?: string }>;
+    };
+
+    const hostedZone = response.HostedZones?.[0];
+    const normalizedCandidate = candidateDomain.endsWith(".")
+      ? candidateDomain
+      : `${candidateDomain}.`;
+
+    if (hostedZone?.Name === normalizedCandidate && hostedZone.Id) {
+      return {
+        PhysicalResourceId: hostedZone.Id.replace("/hostedzone/", ""),
+        Data: {
+          HostedZoneId: hostedZone.Id.replace("/hostedzone/", ""),
+          HostedZoneName: hostedZone.Name,
+        },
+      };
+    }
+  }
+
+  throw new Error(`No hosted zone found for domain '${domainName}'`);
+}
+
+async function handleApiBasePathMapping(
+  event: CloudFormationCustomResourceEvent,
+) {
+  const domainName = String(event.ResourceProperties.DomainName || "").trim();
+  const restApiId = String(event.ResourceProperties.RestApiId || "").trim();
+  const stage = String(event.ResourceProperties.Stage || "prod").trim();
+  const basePath = String(event.ResourceProperties.BasePath || "").trim();
+  const apiBasePath = basePath || "(none)";
+
+  if (!domainName || !restApiId || !stage) {
+    throw new Error(
+      "Custom::ApiBasePathMapping requires DomainName, RestApiId and Stage",
+    );
+  }
+
+  const physicalResourceId = `${domainName}:${apiBasePath}`;
+
+  if (event.RequestType === "Delete") {
+    try {
+      await retryWithBackoff(
+        () =>
+          apiGateway.send(
+            new DeleteBasePathMappingCommand({
+              domainName,
+              basePath: apiBasePath,
+            }),
+          ),
+        API_MAX_RETRIES,
+        API_BASE_DELAY_MS,
+        shouldRetryApiGatewayError,
+      );
+    } catch (error) {
+      if ((error as Error).name !== "NotFoundException") {
+        throw error;
+      }
+    }
+
+    return {
+      PhysicalResourceId: physicalResourceId,
+      Data: { Status: "Deleted" },
+    };
+  }
+
+  if (event.RequestType === "Create") {
+    try {
+      await retryWithBackoff(
+        () =>
+          apiGateway.send(
+            new CreateBasePathMappingCommand({
+              domainName,
+              restApiId,
+              stage,
+              basePath,
+            }),
+          ),
+        API_MAX_RETRIES,
+        API_BASE_DELAY_MS,
+        shouldRetryApiGatewayError,
+      );
+    } catch (error) {
+      if ((error as Error).name !== "ConflictException") {
+        throw error;
+      }
+    }
+
+    return {
+      PhysicalResourceId: physicalResourceId,
+      Data: { DomainName: domainName, RestApiId: restApiId, Stage: stage },
+    };
+  }
+
+  const oldDomainName = String(
+    event.OldResourceProperties?.DomainName || domainName,
+  ).trim();
+  const oldBasePath = String(
+    event.OldResourceProperties?.BasePath || "",
+  ).trim();
+  const oldApiBasePath = oldBasePath || "(none)";
+
+  if (oldDomainName !== domainName || oldApiBasePath !== apiBasePath) {
+    try {
+      await retryWithBackoff(
+        () =>
+          apiGateway.send(
+            new DeleteBasePathMappingCommand({
+              domainName: oldDomainName,
+              basePath: oldApiBasePath,
+            }),
+          ),
+        API_MAX_RETRIES,
+        API_BASE_DELAY_MS,
+        shouldRetryApiGatewayError,
+      );
+    } catch (error) {
+      if ((error as Error).name !== "NotFoundException") {
+        throw error;
+      }
+    }
+
+    await retryWithBackoff(
+      () =>
+        apiGateway.send(
+          new CreateBasePathMappingCommand({
+            domainName,
+            restApiId,
+            stage,
+            basePath,
+          }),
+        ),
+      API_MAX_RETRIES,
+      API_BASE_DELAY_MS,
+      shouldRetryApiGatewayError,
+    );
+  } else {
+    try {
+      await retryWithBackoff(
+        () =>
+          apiGateway.send(
+            new GetBasePathMappingCommand({
+              domainName,
+              basePath: apiBasePath,
+            }),
+          ),
+        API_MAX_RETRIES,
+        API_BASE_DELAY_MS,
+        shouldRetryApiGatewayError,
+      );
+
+      await retryWithBackoff(
+        () =>
+          apiGateway.send(
+            new UpdateBasePathMappingCommand({
+              domainName,
+              basePath: apiBasePath,
+              patchOperations: [
+                { op: "replace", path: "/restapiId", value: restApiId },
+                { op: "replace", path: "/stage", value: stage },
+              ],
+            }),
+          ),
+        API_MAX_RETRIES,
+        API_BASE_DELAY_MS,
+        shouldRetryApiGatewayError,
+      );
+    } catch (error) {
+      if ((error as Error).name === "NotFoundException") {
+        await retryWithBackoff(
+          () =>
+            apiGateway.send(
+              new CreateBasePathMappingCommand({
+                domainName,
+                restApiId,
+                stage,
+                basePath,
+              }),
+            ),
+          API_MAX_RETRIES,
+          API_BASE_DELAY_MS,
+          shouldRetryApiGatewayError,
+        );
+      } else {
+        throw error;
+      }
+    }
+  }
+
+  return {
+    PhysicalResourceId: physicalResourceId,
+    Data: { DomainName: domainName, RestApiId: restApiId, Stage: stage },
+  };
+}
+
 async function buildPathMap(
   restApiId: string,
 ): Promise<Record<string, string>> {
   const map: Record<string, string> = {};
   let position: string | undefined;
   do {
-    const page = await apiGateway.send(
-      new GetResourcesCommand({
-        restApiId,
-        position,
-        limit: 500,
-        embed: ["methods"],
-      }),
+    const page = await sendApiGatewayWithRetry(() =>
+      apiGateway.send(
+        new GetResourcesCommand({
+          restApiId,
+          position,
+          limit: 500,
+          embed: ["methods"],
+        }),
+      ),
     );
     for (const res of page.items || []) {
       if (res.path && res.id) map[res.path] = res.id;
@@ -691,8 +1483,10 @@ async function ensureResourcePath(
   for (const part of pathParts) {
     currentPath += `/${part}`;
     if (!map[currentPath]) {
-      const resp = await apiGateway.send(
-        new CreateResourceCommand({ restApiId, parentId, pathPart: part }),
+      const resp = await sendApiGatewayWithRetry(() =>
+        apiGateway.send(
+          new CreateResourceCommand({ restApiId, parentId, pathPart: part }),
+        ),
       );
       if (!resp.id)
         throw new Error(`Failed to create API resource for ${currentPath}`);
@@ -713,34 +1507,38 @@ async function ensureMethod(
 ): Promise<void> {
   const httpMethod = route.method.toUpperCase();
   try {
-    await apiGateway.send(
-      new PutMethodCommand({
-        restApiId,
-        resourceId,
-        httpMethod,
-        authorizationType: route.authorizationType || "NONE",
-        authorizerId:
-          route.authorizationType === "COGNITO_USER_POOLS"
-            ? route.authorizerId
-            : undefined,
-        authorizationScopes:
-          route.authorizationType === "COGNITO_USER_POOLS"
-            ? route.authorizationScopes
-            : undefined,
-        apiKeyRequired: false,
-      }),
+    await sendApiGatewayWithRetry(() =>
+      apiGateway.send(
+        new PutMethodCommand({
+          restApiId,
+          resourceId,
+          httpMethod,
+          authorizationType: route.authorizationType || "NONE",
+          authorizerId:
+            route.authorizationType === "COGNITO_USER_POOLS"
+              ? route.authorizerId
+              : undefined,
+          authorizationScopes:
+            route.authorizationType === "COGNITO_USER_POOLS"
+              ? route.authorizationScopes
+              : undefined,
+          apiKeyRequired: false,
+        }),
+      ),
     );
   } catch (error) {
     if ((error as Error)?.name !== "ConflictException") throw error;
 
     // Method already exists, update it
     // Get current method settings to compare authorization scopes
-    const current = await apiGateway.send(
-      new GetMethodCommand({
-        restApiId,
-        resourceId,
-        httpMethod,
-      }),
+    const current = await sendApiGatewayWithRetry(() =>
+      apiGateway.send(
+        new GetMethodCommand({
+          restApiId,
+          resourceId,
+          httpMethod,
+        }),
+      ),
     );
 
     const currentScopes = Array.isArray(current.authorizationScopes)
@@ -814,26 +1612,30 @@ async function ensureMethod(
       }
     }
 
-    await apiGateway.send(
-      new UpdateMethodCommand({
-        restApiId,
-        resourceId,
-        httpMethod,
-        patchOperations,
-      }),
+    await sendApiGatewayWithRetry(() =>
+      apiGateway.send(
+        new UpdateMethodCommand({
+          restApiId,
+          resourceId,
+          httpMethod,
+          patchOperations,
+        }),
+      ),
     );
   }
 
-  await apiGateway.send(
-    new PutIntegrationCommand({
-      restApiId,
-      resourceId,
-      httpMethod,
-      type: "AWS_PROXY",
-      integrationHttpMethod: "POST",
-      uri: route.integrationUri,
-      passthroughBehavior: "WHEN_NO_MATCH",
-    }),
+  await sendApiGatewayWithRetry(() =>
+    apiGateway.send(
+      new PutIntegrationCommand({
+        restApiId,
+        resourceId,
+        httpMethod,
+        type: "AWS_PROXY",
+        integrationHttpMethod: "POST",
+        uri: route.integrationUri,
+        passthroughBehavior: "WHEN_NO_MATCH",
+      }),
+    ),
   );
 }
 
@@ -843,60 +1645,68 @@ async function ensureOptionsCors(
   allowMethods: string[],
 ) {
   try {
-    await apiGateway.send(
-      new PutMethodCommand({
-        restApiId,
-        resourceId,
-        httpMethod: "OPTIONS",
-        authorizationType: "NONE",
-        apiKeyRequired: false,
-      }),
+    await sendApiGatewayWithRetry(() =>
+      apiGateway.send(
+        new PutMethodCommand({
+          restApiId,
+          resourceId,
+          httpMethod: "OPTIONS",
+          authorizationType: "NONE",
+          apiKeyRequired: false,
+        }),
+      ),
     );
   } catch (error) {
     if ((error as Error)?.name !== "ConflictException") throw error;
   }
 
-  await apiGateway.send(
-    new PutIntegrationCommand({
-      restApiId,
-      resourceId,
-      httpMethod: "OPTIONS",
-      type: "MOCK",
-      requestTemplates: { "application/json": '{"statusCode": 200}' },
-    }),
+  await sendApiGatewayWithRetry(() =>
+    apiGateway.send(
+      new PutIntegrationCommand({
+        restApiId,
+        resourceId,
+        httpMethod: "OPTIONS",
+        type: "MOCK",
+        requestTemplates: { "application/json": '{"statusCode": 200}' },
+      }),
+    ),
   );
 
   try {
-    await apiGateway.send(
-      new PutMethodResponseCommand({
+    await sendApiGatewayWithRetry(() =>
+      apiGateway.send(
+        new PutMethodResponseCommand({
+          restApiId,
+          resourceId,
+          httpMethod: "OPTIONS",
+          statusCode: "200",
+          responseParameters: {
+            "method.response.header.Access-Control-Allow-Origin": true,
+            "method.response.header.Access-Control-Allow-Headers": true,
+            "method.response.header.Access-Control-Allow-Methods": true,
+          },
+        }),
+      ),
+    );
+  } catch (error) {
+    if ((error as Error)?.name !== "ConflictException") throw error;
+  }
+
+  await sendApiGatewayWithRetry(() =>
+    apiGateway.send(
+      new PutIntegrationResponseCommand({
         restApiId,
         resourceId,
         httpMethod: "OPTIONS",
         statusCode: "200",
         responseParameters: {
-          "method.response.header.Access-Control-Allow-Origin": true,
-          "method.response.header.Access-Control-Allow-Headers": true,
-          "method.response.header.Access-Control-Allow-Methods": true,
+          "method.response.header.Access-Control-Allow-Origin": "'*'",
+          "method.response.header.Access-Control-Allow-Headers":
+            "'Content-Type,Authorization,X-Amz-Date,X-Api-Key,X-Amz-Security-Token,X-Request-Id,X-Recaptcha-Token'",
+          "method.response.header.Access-Control-Allow-Methods": `'${Array.from(new Set([...allowMethods.map((m) => m.toUpperCase()), "OPTIONS"])).join(",")}'`,
         },
       }),
-    );
-  } catch (error) {
-    if ((error as Error)?.name !== "ConflictException") throw error;
-  }
-
-  await apiGateway.send(
-    new PutIntegrationResponseCommand({
-      restApiId,
-      resourceId,
-      httpMethod: "OPTIONS",
-      statusCode: "200",
-      responseParameters: {
-        "method.response.header.Access-Control-Allow-Origin": "'*'",
-        "method.response.header.Access-Control-Allow-Headers":
-          "'Content-Type,Authorization,X-Amz-Date,X-Api-Key,X-Amz-Security-Token,X-Request-Id,X-Recaptcha-Token'",
-        "method.response.header.Access-Control-Allow-Methods": `'${Array.from(new Set([...allowMethods.map((m) => m.toUpperCase()), "OPTIONS"])).join(",")}'`,
-      },
-    }),
+    ),
   );
 }
 
@@ -1012,12 +1822,14 @@ async function handleApiRoutes(event: CloudFormationCustomResourceEvent) {
     await ensureOptionsCors(restApiId, resourceId, Array.from(methods));
   }
 
-  await apiGateway.send(
-    new CreateDeploymentCommand({
-      restApiId,
-      stageName,
-      description: `WP Suite Workflows routes updated at ${new Date().toISOString()}`,
-    }),
+  await sendApiGatewayWithRetry(() =>
+    apiGateway.send(
+      new CreateDeploymentCommand({
+        restApiId,
+        stageName,
+        description: `WP Suite Workflows routes updated at ${new Date().toISOString()}`,
+      }),
+    ),
   );
   return {
     PhysicalResourceId: `${restApiId}|routes`,
@@ -1034,8 +1846,15 @@ export const handler = async (
     requestType: event.RequestType,
     logicalResourceId: event.LogicalResourceId,
   });
+  let result:
+    | { PhysicalResourceId?: string; Data?: Record<string, unknown> }
+    | undefined;
+  let status: "SUCCESS" | "FAILED" = "SUCCESS";
+  let responseData: Record<string, unknown>;
+  let physicalResourceId = event.PhysicalResourceId;
+  let reason: string | undefined;
+
   try {
-    let result: { PhysicalResourceId?: string; Data?: Record<string, unknown> };
     switch (event.ResourceType) {
       case "Custom::SSMParameter":
         result = await handleSsmSecret(event);
@@ -1055,31 +1874,56 @@ export const handler = async (
       case "Custom::ApiRoutes":
         result = await handleApiRoutes(event);
         break;
+      case "Custom::ApiAuthorizer":
+        result = await handleApiAuthorizer(event);
+        break;
+      case "Custom::HostedZoneLookup":
+        result = await handleHostedZoneLookup(event);
+        break;
+      case "Custom::ApiBasePathMapping":
+        result = await handleApiBasePathMapping(event);
+        break;
       case "Custom::GuardDutyMalwareProtectionPlan":
         result = await handleGuardDutyMalwareProtectionPlan(event);
         break;
       default:
         throw new Error(`Unsupported resource type: ${event.ResourceType}`);
     }
-    await sendResponse(
-      event,
-      context,
-      "SUCCESS",
-      result.Data || {},
-      result.PhysicalResourceId,
-    );
+
+    responseData = result?.Data || {};
+    physicalResourceId = result?.PhysicalResourceId || event.PhysicalResourceId;
   } catch (error) {
+    status = "FAILED";
+    reason = error instanceof Error ? error.message : "Unknown";
     logError("Custom resource operation failed", error, {
       resourceType: event.ResourceType,
       requestType: event.RequestType,
     });
+    responseData = {
+      Error: error instanceof Error ? error.message : "Unknown",
+      ErrorType: error instanceof Error ? error.name : "UnknownError",
+    };
+  }
+
+  try {
     await sendResponse(
       event,
       context,
-      "FAILED",
-      { Error: error instanceof Error ? error.message : "Unknown" },
-      event.PhysicalResourceId,
-      error instanceof Error ? error.message : "Unknown",
+      status,
+      responseData,
+      physicalResourceId,
+      reason,
     );
+  } catch (responseError) {
+    logError(
+      "Failed to send CloudFormation custom resource response",
+      responseError as Error,
+      {
+        resourceType: event.ResourceType,
+        requestType: event.RequestType,
+        status,
+      },
+    );
+    throw responseError;
   }
 };

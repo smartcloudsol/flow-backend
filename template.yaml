@@ -2,14 +2,22 @@ AWSTemplateFormatVersion: "2010-09-09"
 Transform: AWS::Serverless-2016-10-31
 Description: WP Suite Flow backend with forms API, templates, workflows, email, webhook, WAF and reCAPTCHA support
 
+Rules:
+  CustomDomainRequiresCertificate:
+    Assertions:
+      - Assert: !Or
+          - !Equals [!Ref ApiCustomDomainName, ""]
+          - !Not [!Equals [!Ref AcmCertificateArn, ""]]
+        AssertDescription: AcmCertificateArn is required when ApiCustomDomainName is specified.
+
 Metadata:
   AWS::ServerlessRepo::Application:
     Name: WP Suite Flow Backend
     Description: Event-driven forms, submissions, email templates, and workflow automation backend for WordPress sites using WP Suite Flow
     Author: Smart Cloud Solutions
     SpdxLicenseId: MIT
-    LicenseUrl: s3://wpsuite-artifacts/wpsuite-flow/${DeploymentVersion}/docs/LICENSE
-    ReadmeUrl: s3://wpsuite-artifacts/wpsuite-flow/${DeploymentVersion}/docs/SAR-README.md
+    LicenseUrl: !Sub s3://${ArtifactBucketName}/${ArtifactKeyPrefix}/${DeploymentVersion}/docs/LICENSE
+    ReadmeUrl: !Sub s3://${ArtifactBucketName}/${ArtifactKeyPrefix}/${DeploymentVersion}/docs/SAR-README.md
     Labels:
       [
         wordpress,
@@ -22,109 +30,196 @@ Metadata:
         serverless,
       ]
     HomePageUrl: https://wpsuite.io/flow/
-    SemanticVersion: ${DeploymentVersion}
+    SemanticVersion: !Ref DeploymentVersion
 
 Parameters:
+  DeploymentVersion:
+    Type: String
+    Default: 1.0.0
+    Description: Application version used to locate Lambda, docs, and template artifacts in S3.
+  ArtifactBucketName:
+    Type: String
+    Default: wpsuite-artifacts
+    Description: S3 bucket that stores the published deployment artifacts for this application.
+  ArtifactKeyPrefix:
+    Type: String
+    Default: wpsuite-flow
+    Description: S3 key prefix under the artifact bucket for this Flow application.
   AppName:
     Type: String
     Default: wpsuite-flow
+    Description: Application name prefix used when naming Flow resources.
   Environment:
     Type: String
     Default: prod
     AllowedValues: [dev, staging, prod]
-  DeploymentVersion:
-    Type: String
-    Default: 1.0.0
+    Description: Deployment environment used in generated resource names.
   FrontendApiAuthMode:
     Type: String
     Default: NONE
     AllowedValues: [NONE, IAM]
+    Description: Authentication mode for public frontend submission endpoints.
   AdminApiAuthMode:
     Type: String
     Default: COGNITO
     AllowedValues: [NONE, IAM, COGNITO]
+    Description: Authentication mode for admin management endpoints.
   AdminCognitoUserPoolId:
     Type: String
     Default: ""
+    Description: Cognito user pool ID for admin authentication when AdminApiAuthMode is COGNITO.
   AdminCognitoAuthScopes:
     Type: CommaDelimitedList
     Default: ""
+    Description: Optional OAuth scopes required on admin endpoints when Cognito auth is enabled.
   EnableRecaptcha:
     Type: String
     Default: "false"
     AllowedValues: ["true", "false"]
+    Description: Enable Google reCAPTCHA validation for public form submissions.
   RecaptchaMode:
     Type: String
     Default: classic
     AllowedValues: [classic, enterprise]
+    Description: Which reCAPTCHA product to use when reCAPTCHA protection is enabled.
   RecaptchaProjectId:
     Type: String
     Default: ""
+    Description: Google Cloud project ID for reCAPTCHA Enterprise.
   RecaptchaSiteKey:
     Type: String
     Default: ""
+    Description: Public reCAPTCHA site key expected from the frontend.
   RecaptchaSecretKey:
     Type: String
     Default: ""
     NoEcho: true
+    Description: Secret reCAPTCHA key stored in SSM Parameter Store when provided.
   RecaptchaScoreThreshold:
     Type: Number
     Default: 0.5
+    Description: Minimum accepted reCAPTCHA score from 0.0 to 1.0.
   EnableWAF:
     Type: String
     Default: "false"
     AllowedValues: ["true", "false"]
+    Description: Enable AWS WAF protection for the Flow API.
   PublicAllowedIPs:
     Type: CommaDelimitedList
     Default: ""
+    Description: Optional CIDR allowlist for public submission endpoints.
   AdminAllowedIPs:
     Type: CommaDelimitedList
     Default: ""
+    Description: Optional CIDR allowlist for admin endpoints.
   BlockedIPs:
     Type: CommaDelimitedList
     Default: ""
+    Description: Optional CIDR ranges to block for all API traffic.
   EnableKmsForSecrets:
     Type: String
     Default: "false"
     AllowedValues: ["true", "false"]
+    Description: Create a dedicated KMS key for encrypting SSM-stored secrets.
   EnableGuardDutyMalwareProtection:
     Type: String
     Default: "false"
     AllowedValues: ["true", "false"]
+    Description: Enable GuardDuty Malware Protection for the payload bucket.
   DataRetentionDays:
     Type: Number
     Default: 30
+    Description: Number of days to retain submission data before TTL cleanup.
   LogRetentionDays:
     Type: Number
     Default: 14
+    AllowedValues:
+      [
+        1,
+        3,
+        5,
+        7,
+        14,
+        30,
+        60,
+        90,
+        120,
+        150,
+        180,
+        365,
+        400,
+        545,
+        731,
+        1827,
+        3653,
+      ]
+    Description: Number of days to retain CloudWatch logs for Flow resources.
   LambdaMemorySize:
     Type: Number
     Default: 1024
+    Description: Memory size in MB allocated to Flow Lambda functions.
   LambdaTimeout:
     Type: Number
     Default: 30
+    Description: Maximum execution time in seconds for Flow Lambda functions.
   LogLevel:
     Type: String
     Default: INFO
     AllowedValues: [DEBUG, INFO, WARN, ERROR]
+    Description: Application log level used by Flow Lambda functions.
   TemplatesBucketName:
     Type: String
     Default: ""
+    Description: Existing S3 bucket for email templates. Leave empty to create one.
   PayloadBucketName:
     Type: String
     Default: ""
+    Description: Existing S3 bucket for uploaded files. Leave empty to create one.
   TemplatesPrefix:
     Type: String
     Default: templates/
+    Description: S3 prefix used to store and resolve email template files.
   FromEmail:
     Type: String
     Default: ""
+    Description: SES-verified email address used as the sender for outbound email actions.
   DefaultWebhookSigningSecret:
     Type: String
     Default: ""
     NoEcho: true
+    Description: Optional default HMAC secret used to sign webhook payloads.
+  ApiCustomDomainName:
+    Type: String
+    Default: ""
+    Description: Custom domain name for the API (optional, e.g. forms.example.com)
+    AllowedPattern: ^$|^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$
+    ConstraintDescription: Must be a valid domain name or empty.
+  AcmCertificateArn:
+    Type: String
+    Default: ""
+    Description: ACM certificate ARN for the custom domain (required when ApiCustomDomainName is set)
+    AllowedPattern: ^$|^arn:aws(-[a-z0-9-]+)?:acm:[a-z0-9-]+:[0-9]{12}:certificate/[a-f0-9-]+$
+    ConstraintDescription: Must be a valid ACM certificate ARN or empty.
+  EnableRoute53:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: Enable automatic Route53 alias record creation for the custom domain
+  Route53HostedZoneId:
+    Type: String
+    Default: ""
+    Description: Route53 hosted zone ID (optional, auto-discovered when empty)
+    AllowedPattern: ^$|^[A-Z0-9]{10,32}$
+    ConstraintDescription: Must be a valid hosted zone ID or empty.
 
 Conditions:
+  UseCustomDomain: !Not [!Equals [!Ref ApiCustomDomainName, ""]]
+  UseRoute53: !And
+    - !Condition UseCustomDomain
+    - !Equals [!Ref EnableRoute53, "true"]
+  UseProvidedHostedZoneId: !And
+    - !Condition UseRoute53
+    - !Not [!Equals [!Ref Route53HostedZoneId, ""]]
   EnableRecaptchaProtection: !Equals [!Ref EnableRecaptcha, "true"]
   WAFEnabled: !Equals [!Ref EnableWAF, "true"]
   HasPublicAllowedIPs:
@@ -206,10 +301,21 @@ Resources:
       EndpointConfiguration:
         Types: [REGIONAL]
 
+  ApiDomainName:
+    Type: AWS::ApiGateway::DomainName
+    Condition: UseCustomDomain
+    Properties:
+      DomainName: !Ref ApiCustomDomainName
+      RegionalCertificateArn: !Ref AcmCertificateArn
+      EndpointConfiguration:
+        Types: [REGIONAL]
+      SecurityPolicy: TLS_1_2
+
   AdminAuthorizer:
-    Type: AWS::ApiGateway::Authorizer
+    Type: Custom::ApiAuthorizer
     Condition: UseAdminCognito
     Properties:
+      ServiceToken: !GetAtt CustomResourceManagerFunction.Arn
       Name: !Sub "${AppName}-${Environment}-admin-cognito-authorizer"
       RestApiId: !Ref RestApi
       Type: COGNITO_USER_POOLS
@@ -274,6 +380,25 @@ Resources:
           PolicyDocument:
             Version: "2012-10-17"
             Statement:
+              - Sid: ManagedRuleLifecycle
+                Effect: Allow
+                Action:
+                  - events:PutRule
+                  - events:DeleteRule
+                  - events:PutTargets
+                  - events:RemoveTargets
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:events:${AWS::Region}:${AWS::AccountId}:rule/DO-NOT-DELETE-AmazonGuardDutyMalwareProtectionS3*"
+                Condition:
+                  StringLike:
+                    events:ManagedBy: malware-protection-plan.guardduty.amazonaws.com
+              - Sid: ManagedRuleRead
+                Effect: Allow
+                Action:
+                  - events:DescribeRule
+                  - events:ListTargetsByRule
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:events:${AWS::Region}:${AWS::AccountId}:rule/DO-NOT-DELETE-AmazonGuardDutyMalwareProtectionS3*"
               - Sid: BucketMetadata
                 Effect: Allow
                 Action:
@@ -300,6 +425,26 @@ Resources:
                     - UseProvidedPayloadBucket
                     - !Sub "arn:${AWS::Partition}:s3:::${PayloadBucketName}/*"
                     - !Sub "${PayloadBucket.Arn}/*"
+              - Sid: PutValidationObject
+                Effect: Allow
+                Action:
+                  - s3:PutObject
+                Resource:
+                  - !If
+                    - UseProvidedPayloadBucket
+                    - !Sub "arn:${AWS::Partition}:s3:::${PayloadBucketName}/malware-protection-resource-validation-object"
+                    - !Sub "${PayloadBucket.Arn}/malware-protection-resource-validation-object"
+              - Sid: AllowDecryptForMalwareScan
+                Effect: Allow
+                Action:
+                  - kms:GenerateDataKey
+                  - kms:Decrypt
+                  - kms:DescribeKey
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:kms:${AWS::Region}:${AWS::AccountId}:key/*"
+                Condition:
+                  StringLike:
+                    kms:ViaService: !Sub "s3.${AWS::Region}.${AWS::URLSuffix}"
 
   GuardDutyMalwareProtectionPlan:
     Type: Custom::GuardDutyMalwareProtectionPlan
@@ -491,13 +636,14 @@ Resources:
     Properties:
       FunctionName: !Sub "${AppName}-${Environment}-custom-resource-manager"
       CodeUri:
-        Bucket: wpsuite-artifacts
-        Key: wpsuite-flow/${DeploymentVersion}/functions/custom-resource.zip
+        Bucket: !Ref ArtifactBucketName
+        Key: !Sub ${ArtifactKeyPrefix}/${DeploymentVersion}/functions/custom-resource.zip
       Handler: index.handler
       Policies:
         - Statement:
             - Effect: Allow
               Action:
+                - route53:ListHostedZonesByName
                 - ssm:PutParameter
                 - ssm:DeleteParameter
                 - ssm:GetParameter
@@ -523,6 +669,8 @@ Resources:
                 - guardduty:UpdateMalwareProtectionPlan
                 - guardduty:GetMalwareProtectionPlan
                 - guardduty:DeleteMalwareProtectionPlan
+                - guardduty:TagResource
+                - guardduty:UntagResource
                 - iam:PassRole
                 - apigateway:*
               Resource: "*"
@@ -687,8 +835,8 @@ Resources:
     Properties:
       FunctionName: !Sub "${AppName}-${Environment}-forms-api"
       CodeUri:
-        Bucket: wpsuite-artifacts
-        Key: wpsuite-flow/${DeploymentVersion}/functions/forms-api.zip
+        Bucket: !Ref ArtifactBucketName
+        Key: !Sub ${ArtifactKeyPrefix}/${DeploymentVersion}/functions/forms-api.zip
       Handler: index.handler
       DeadLetterQueue: { Type: SQS, TargetArn: !GetAtt DeadLetterQueue.Arn }
       Policies:
@@ -753,7 +901,6 @@ Resources:
   ApiRoutes:
     Type: Custom::ApiRoutes
     DependsOn:
-      - FormsApiFunction
       - FormsApiInvokePermission
     Properties:
       ServiceToken: !GetAtt CustomResourceManagerFunction.Arn
@@ -764,6 +911,57 @@ Resources:
       AdminAuthMode: !Ref AdminApiAuthMode
       AdminAuthorizerId: !If [UseAdminCognito, !Ref AdminAuthorizer, ""]
       AdminAuthorizationScopes: !Join [",", !Ref AdminCognitoAuthScopes]
+
+  ApiBasePathMapping:
+    Type: Custom::ApiBasePathMapping
+    Condition: UseCustomDomain
+    DependsOn:
+      - ApiRoutes
+    Properties:
+      ServiceToken: !GetAtt CustomResourceManagerFunction.Arn
+      DomainName: !Ref ApiDomainName
+      RestApiId: !Ref RestApi
+      Stage: prod
+      BasePath: ""
+
+  HostedZoneLookup:
+    Type: Custom::HostedZoneLookup
+    Condition: UseRoute53
+    Properties:
+      ServiceToken: !GetAtt CustomResourceManagerFunction.Arn
+      DomainName: !Ref ApiCustomDomainName
+
+  DnsRecordA:
+    Type: AWS::Route53::RecordSet
+    Condition: UseRoute53
+    DependsOn:
+      - ApiBasePathMapping
+    Properties:
+      HostedZoneId: !If
+        - UseProvidedHostedZoneId
+        - !Ref Route53HostedZoneId
+        - !GetAtt HostedZoneLookup.HostedZoneId
+      Name: !Ref ApiCustomDomainName
+      Type: A
+      AliasTarget:
+        DNSName: !GetAtt ApiDomainName.RegionalDomainName
+        HostedZoneId: !GetAtt ApiDomainName.RegionalHostedZoneId
+
+  DnsRecordAAAA:
+    Type: AWS::Route53::RecordSet
+    Condition: UseRoute53
+    DependsOn:
+      - ApiBasePathMapping
+    Properties:
+      HostedZoneId: !If
+        - UseProvidedHostedZoneId
+        - !Ref Route53HostedZoneId
+        - !GetAtt HostedZoneLookup.HostedZoneId
+      Name: !Ref ApiCustomDomainName
+      Type: AAAA
+      AliasTarget:
+        DNSName: !GetAtt ApiDomainName.RegionalDomainName
+        HostedZoneId: !GetAtt ApiDomainName.RegionalHostedZoneId
 
   WorkflowDispatcherLogGroup:
     Type: AWS::Logs::LogGroup
@@ -776,8 +974,8 @@ Resources:
     Properties:
       FunctionName: !Sub "${AppName}-${Environment}-workflow-dispatcher"
       CodeUri:
-        Bucket: wpsuite-artifacts
-        Key: wpsuite-flow/${DeploymentVersion}/functions/workflow-dispatcher.zip
+        Bucket: !Ref ArtifactBucketName
+        Key: !Sub ${ArtifactKeyPrefix}/${DeploymentVersion}/functions/workflow-dispatcher.zip
       Handler: index.handler
       DeadLetterQueue: { Type: SQS, TargetArn: !GetAtt DeadLetterQueue.Arn }
       Policies:
@@ -817,8 +1015,8 @@ Resources:
     Properties:
       FunctionName: !Sub "${AppName}-${Environment}-email-sender"
       CodeUri:
-        Bucket: wpsuite-artifacts
-        Key: wpsuite-flow/${DeploymentVersion}/functions/email-sender.zip
+        Bucket: !Ref ArtifactBucketName
+        Key: !Sub ${ArtifactKeyPrefix}/${DeploymentVersion}/functions/email-sender.zip
       Handler: index.handler
       DeadLetterQueue: { Type: SQS, TargetArn: !GetAtt DeadLetterQueue.Arn }
       Policies:
@@ -856,8 +1054,8 @@ Resources:
     Properties:
       FunctionName: !Sub "${AppName}-${Environment}-webhook-dispatcher"
       CodeUri:
-        Bucket: wpsuite-artifacts
-        Key: wpsuite-flow/${DeploymentVersion}/functions/webhook-dispatcher.zip
+        Bucket: !Ref ArtifactBucketName
+        Key: !Sub ${ArtifactKeyPrefix}/${DeploymentVersion}/functions/webhook-dispatcher.zip
       Handler: index.handler
       DeadLetterQueue: { Type: SQS, TargetArn: !GetAtt DeadLetterQueue.Arn }
       Policies:
@@ -896,7 +1094,10 @@ Resources:
 
 Outputs:
   ApiUrl:
-    Value: !Sub "https://${RestApi}.execute-api.${AWS::Region}.amazonaws.com/prod"
+    Value: !If
+      - UseCustomDomain
+      - !Sub "https://${ApiCustomDomainName}"
+      - !Sub "https://${RestApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}/prod"
   TemplatesBucketOutput:
     Value:
       !If [
@@ -910,3 +1111,12 @@ Outputs:
   RecaptchaSecretParameterName:
     Condition: EnableRecaptchaProtection
     Value: !Ref RecaptchaSecretParameter
+  CustomDomainUrl:
+    Condition: UseCustomDomain
+    Value: !Sub "https://${ApiCustomDomainName}"
+  RegionalDomainName:
+    Condition: UseCustomDomain
+    Value: !GetAtt ApiDomainName.RegionalDomainName
+  RegionalHostedZoneId:
+    Condition: UseCustomDomain
+    Value: !GetAtt ApiDomainName.RegionalHostedZoneId

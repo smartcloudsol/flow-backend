@@ -1,6 +1,8 @@
 AWSTemplateFormatVersion: "2010-09-09"
-Description: "WP Suite Flow Backend - CloudFormation wrapper that deploys the SAR app (better UX + SAR regional packaging)"
-Transform: AWS::Serverless-2016-10-31
+Description: "WP Suite Workflows Backend - CloudFormation wrapper for the published nested backend stack"
+
+Conditions:
+  UseCustomDomain: !Not [!Equals [!Ref ApiCustomDomainName, ""]]
 
 Metadata:
   AWS::CloudFormation::Interface:
@@ -8,11 +10,8 @@ Metadata:
       - Label:
           default: "Deployment Basics"
         Parameters:
-          - SarApplicationId
-          - SarSemanticVersion
           - AppName
           - Environment
-          - DeploymentVersion
 
       - Label:
           default: "Authentication & Access Control"
@@ -36,6 +35,11 @@ Metadata:
           - AdminAllowedIPs
           - BlockedIPs
           - EnableKmsForSecrets
+          - EnableGuardDutyMalwareProtection
+          - ApiCustomDomainName
+          - AcmCertificateArn
+          - EnableRoute53
+          - Route53HostedZoneId
 
       - Label:
           default: "Storage Configuration"
@@ -57,19 +61,14 @@ Metadata:
           - LogRetentionDays
           - LambdaMemorySize
           - LambdaTimeout
+          - LogLevel
 
     ParameterLabels:
       # Deployment Basics
-      SarApplicationId:
-        default: "SAR Application ID"
-      SarSemanticVersion:
-        default: "Version"
       AppName:
         default: "Application Name"
       Environment:
         default: "Environment"
-      DeploymentVersion:
-        default: "Deployment Version"
 
       # Authentication
       FrontendApiAuthMode:
@@ -104,6 +103,16 @@ Metadata:
         default: "Blocked IPs"
       EnableKmsForSecrets:
         default: "Enable KMS Encryption for Secrets"
+      EnableGuardDutyMalwareProtection:
+        default: "Enable GuardDuty Malware Protection for Uploads"
+      ApiCustomDomainName:
+        default: "API Custom Domain Name"
+      AcmCertificateArn:
+        default: "ACM Certificate ARN"
+      EnableRoute53:
+        default: "Auto-configure Route53 DNS"
+      Route53HostedZoneId:
+        default: "Route53 Hosted Zone ID"
 
       # Storage
       TemplatesBucketName:
@@ -128,28 +137,31 @@ Metadata:
         default: "Lambda Memory Size (MB)"
       LambdaTimeout:
         default: "Lambda Timeout (seconds)"
+      LogLevel:
+        default: "Logging Level"
 
 Parameters:
-  SarApplicationId:
+  DeploymentVersion:
     Type: String
-    Description: "SAR ApplicationId ARN (arn:aws:serverlessrepo:REGION:ACCOUNT:applications/NAME)"
-    Default: "arn:aws:serverlessrepo:us-east-1:637423296378:applications/wpsuite-flow"
-    AllowedPattern: ^arn:aws:serverlessrepo:.*:applications\/.*$
-    ConstraintDescription: "Must be a valid Serverless Application Repository ApplicationId ARN"
+    Default: 1.0.0
+    Description: "Application version used to locate the published nested backend template in S3"
 
-  SarSemanticVersion:
+  ArtifactBucketName:
     Type: String
-    Description: "SAR semantic version to deploy (e.g. 1.0.3)"
-    Default: "1.0.3"
-    AllowedPattern: ^\d+\.\d+\.\d+$
-    ConstraintDescription: "Must be a semantic version like 1.0.3"
+    Default: wpsuite-artifacts
+    Description: "S3 bucket that stores the published deployment artifacts for this application"
 
-  # ---- pass-through parameters for the SAR app ----
+  ArtifactKeyPrefix:
+    Type: String
+    Default: wpsuite-flow
+    Description: "S3 key prefix under the artifact bucket for this Flow application"
+
+  # ---- pass-through parameters for the backend app ----
 
   # Core Application Settings
   AppName:
     Type: String
-    Default: wpsflow
+    Default: wpsworkflows
     Description: "Application name for resource naming (alphanumeric and hyphens only)"
 
   Environment:
@@ -157,11 +169,6 @@ Parameters:
     Default: prod
     AllowedValues: [dev, staging, prod]
     Description: "Deployment environment"
-
-  DeploymentVersion:
-    Type: String
-    Default: "1.0.3"
-    Description: "Version string for deployment tracking"
 
   # Authentication Configuration
   FrontendApiAuthMode:
@@ -250,6 +257,33 @@ Parameters:
     AllowedValues: ["true", "false"]
     Description: "Create a dedicated KMS key for encrypting secrets in SSM Parameter Store"
 
+  EnableGuardDutyMalwareProtection:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: "Enable Amazon GuardDuty Malware Protection for the payload bucket. GuardDuty must already be enabled in the target account and region."
+
+  ApiCustomDomainName:
+    Type: String
+    Default: ""
+    Description: "Custom domain name for the API (optional, e.g. forms.example.com)"
+
+  AcmCertificateArn:
+    Type: String
+    Default: ""
+    Description: "ACM certificate ARN for the custom domain (required if ApiCustomDomainName is set)"
+
+  EnableRoute53:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: "Enable automatic Route53 DNS configuration for custom domain"
+
+  Route53HostedZoneId:
+    Type: String
+    Default: ""
+    Description: "Route53 hosted zone ID (optional, will be auto-discovered if empty)"
+
   # Storage Configuration
   TemplatesBucketName:
     Type: String
@@ -308,18 +342,21 @@ Parameters:
     MaxValue: 900
     Description: "Maximum execution time for Lambda functions (seconds)"
 
+  LogLevel:
+    Type: String
+    Default: INFO
+    AllowedValues: [DEBUG, INFO, WARN, ERROR]
+    Description: "Logging level for Lambda functions (DEBUG for detailed logs, INFO for normal operation)"
+
 Resources:
   FlowBackend:
-    Type: AWS::Serverless::Application
+    Type: AWS::CloudFormation::Stack
     Properties:
-      Location:
-        ApplicationId: !Ref SarApplicationId
-        SemanticVersion: !Ref SarSemanticVersion
+      TemplateURL: !Sub https://${ArtifactBucketName}.s3.${AWS::Region}.amazonaws.com/${ArtifactKeyPrefix}/${DeploymentVersion}/template.yaml
       Parameters:
         # Core Application Settings
         AppName: !Ref AppName
         Environment: !Ref Environment
-        DeploymentVersion: !Ref DeploymentVersion
 
         # Authentication Configuration
         FrontendApiAuthMode: !Ref FrontendApiAuthMode
@@ -343,6 +380,11 @@ Resources:
 
         # Security
         EnableKmsForSecrets: !Ref EnableKmsForSecrets
+        EnableGuardDutyMalwareProtection: !Ref EnableGuardDutyMalwareProtection
+        ApiCustomDomainName: !Ref ApiCustomDomainName
+        AcmCertificateArn: !Ref AcmCertificateArn
+        EnableRoute53: !Ref EnableRoute53
+        Route53HostedZoneId: !Ref Route53HostedZoneId
 
         # Storage Configuration
         TemplatesBucketName: !Ref TemplatesBucketName
@@ -360,10 +402,11 @@ Resources:
         # Performance Configuration
         LambdaMemorySize: !Ref LambdaMemorySize
         LambdaTimeout: !Ref LambdaTimeout
+        LogLevel: !Ref LogLevel
 
 Outputs:
   ApiUrl:
-    Description: "Base URL for the Flow API"
+    Description: "Base URL for the Workflows API"
     Value: !GetAtt FlowBackend.Outputs.ApiUrl
 
   TemplatesBucketOutput:
@@ -373,3 +416,18 @@ Outputs:
   PayloadBucketOutput:
     Description: "S3 bucket for file uploads"
     Value: !GetAtt FlowBackend.Outputs.PayloadBucketOutput
+
+  CustomDomainUrl:
+    Condition: UseCustomDomain
+    Description: "Custom domain URL when configured"
+    Value: !GetAtt FlowBackend.Outputs.CustomDomainUrl
+
+  RegionalDomainName:
+    Condition: UseCustomDomain
+    Description: "Regional API Gateway domain name when custom domain is configured"
+    Value: !GetAtt FlowBackend.Outputs.RegionalDomainName
+
+  RegionalHostedZoneId:
+    Condition: UseCustomDomain
+    Description: "Regional API Gateway hosted zone ID when custom domain is configured"
+    Value: !GetAtt FlowBackend.Outputs.RegionalHostedZoneId
