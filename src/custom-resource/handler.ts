@@ -60,6 +60,11 @@ import {
   VisibilityConfig,
   WAFV2Client,
 } from "@aws-sdk/client-wafv2";
+import {
+  CloudWatchLogsClient,
+  CreateLogGroupCommand,
+  PutRetentionPolicyCommand,
+} from "@aws-sdk/client-cloudwatch-logs";
 import { logError, logInfo } from "../shared/logger";
 import {
   CloudFormationCustomResourceEvent,
@@ -72,6 +77,7 @@ const apiGateway = new APIGatewayClient({});
 const guardDuty = new GuardDutyClient({});
 const s3 = new S3Client({});
 const route53 = new Route53Client({});
+const cloudWatchLogs = new CloudWatchLogsClient({});
 
 const API_MAX_RETRIES = 6;
 const API_BASE_DELAY_MS = 1000;
@@ -793,6 +799,65 @@ async function handleBucketCleaner(event: CloudFormationCustomResourceEvent) {
       VersionsDeleted: deletedVersions,
       DeleteMarkersDeleted: deletedMarkers,
       MultipartUploadsAborted: abortedUploads,
+    },
+  };
+}
+
+async function handleLogGroupManager(event: CloudFormationCustomResourceEvent) {
+  const logGroupName = String(
+    event.ResourceProperties.LogGroupName || "",
+  ).trim();
+  const retentionValue = event.ResourceProperties.RetentionInDays;
+
+  if (!logGroupName) {
+    throw new Error("LogGroupName is required");
+  }
+
+  if (event.RequestType === "Delete") {
+    return {
+      PhysicalResourceId: logGroupName,
+      Data: { LogGroupName: logGroupName, Status: "Deleted" },
+    };
+  }
+
+  await cloudWatchLogs
+    .send(new CreateLogGroupCommand({ logGroupName }))
+    .catch((error: Error & { name?: string }) => {
+      if (error.name !== "ResourceAlreadyExistsException") {
+        throw error;
+      }
+    });
+
+  if (
+    retentionValue !== undefined &&
+    retentionValue !== null &&
+    retentionValue !== ""
+  ) {
+    const retentionInDays = Number(retentionValue);
+    if (!Number.isFinite(retentionInDays)) {
+      throw new Error(`Invalid RetentionInDays: ${String(retentionValue)}`);
+    }
+    await cloudWatchLogs.send(
+      new PutRetentionPolicyCommand({
+        logGroupName,
+        retentionInDays,
+      }),
+    );
+    return {
+      PhysicalResourceId: logGroupName,
+      Data: {
+        LogGroupName: logGroupName,
+        RetentionInDays: retentionInDays,
+        Status: event.RequestType === "Create" ? "Created" : "Updated",
+      },
+    };
+  }
+
+  return {
+    PhysicalResourceId: logGroupName,
+    Data: {
+      LogGroupName: logGroupName,
+      Status: event.RequestType === "Create" ? "Created" : "Updated",
     },
   };
 }
@@ -1885,6 +1950,9 @@ export const handler = async (
         break;
       case "Custom::GuardDutyMalwareProtectionPlan":
         result = await handleGuardDutyMalwareProtectionPlan(event);
+        break;
+      case "Custom::LogGroupManager":
+        result = await handleLogGroupManager(event);
         break;
       default:
         throw new Error(`Unsupported resource type: ${event.ResourceType}`);

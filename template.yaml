@@ -625,12 +625,6 @@ Resources:
             - { AttributeName: GSI1SK, KeyType: RANGE }
           Projection: { ProjectionType: ALL }
 
-  CustomResourceManagerLogGroup:
-    Type: AWS::Logs::LogGroup
-    Properties:
-      LogGroupName: !Sub "/aws/lambda/${AppName}-${Environment}-custom-resource-manager"
-      RetentionInDays: !Ref LogRetentionDays
-
   CustomResourceManagerFunction:
     Type: AWS::Serverless::Function
     Properties:
@@ -653,6 +647,8 @@ Resources:
                 - s3:DeleteObject
                 - s3:DeleteObjectVersion
                 - s3:AbortMultipartUpload
+                - logs:CreateLogGroup
+                - logs:PutRetentionPolicy
                 - wafv2:AssociateWebACL
                 - wafv2:DisassociateWebACL
                 - wafv2:CreateIPSet
@@ -685,6 +681,13 @@ Resources:
                   - kms:GenerateDataKey
                 Resource: !GetAtt SecretsKmsKey.Arn
           - !Ref AWS::NoValue
+
+  CustomResourceManagerLogGroupManager:
+    Type: Custom::LogGroupManager
+    Properties:
+      ServiceToken: !GetAtt CustomResourceManagerFunction.Arn
+      LogGroupName: !Sub "/aws/lambda/${AppName}-${Environment}-custom-resource-manager"
+      RetentionInDays: !Ref LogRetentionDays
 
   RecaptchaSecretParameter:
     Type: Custom::SSMParameter
